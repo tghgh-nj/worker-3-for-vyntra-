@@ -161,8 +161,9 @@ def claim_render_job(target_job_id=None):
 def storage_download(object_path: str, destination: Path):
     if not object_path or object_path.startswith("/") or ".." in Path(object_path).parts:
         raise ValueError("invalid_media_path")
-    url = SUPABASE_URL + "/storage/v1/object/" + BUCKET + "/" + urllib.parse.quote(object_path, safe="/")
-    req = urllib.request.Request(url, headers={"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"})
+    storage_url, storage_key = source_storage_config(object_path)
+    url = storage_url + "/storage/v1/object/" + BUCKET + "/" + urllib.parse.quote(object_path, safe="/")
+    req = urllib.request.Request(url, headers={"apikey": storage_key, "Authorization": f"Bearer {storage_key}"})
     total = 0
     with urllib.request.urlopen(req, timeout=120) as response, destination.open("wb") as out:
         while True:
@@ -171,6 +172,57 @@ def storage_download(object_path: str, destination: Path):
             total += len(chunk)
             if total > MAX_INPUT_BYTES: raise ValueError("input_too_large")
             out.write(chunk)
+
+
+def source_storage_tier(object_path: str) -> str:
+    """Read the trusted storage tier encoded in newly uploaded source paths.
+
+    Old jobs have paths like <owner>/sources/<uuid>-<name> and remain on the
+    primary project. New jobs use <owner>/sources/{secondary|fallback}/... .
+    """
+    parts = object_path.split("/")
+    if len(parts) >= 4 and parts[1] == "sources" and parts[2] in ("secondary", "fallback"):
+        return parts[2]
+    return "primary"
+
+
+def source_storage_config(object_path: str) -> tuple[str, str]:
+    """Resolve the Supabase project for a source object without trusting URLs."""
+    tier = source_storage_tier(object_path)
+    if tier == "secondary":
+        url = os.getenv("VYNTRA_SOURCE_SECONDARY_SUPABASE_URL", "https://vfaakmxoeflzedwidlcl.supabase.co").rstrip("/")
+        key = os.getenv("VYNTRA_SOURCE_SECONDARY_SERVICE_ROLE_KEY") or os.getenv("VYNTRA_OUTPUT_SUPABASE_SERVICE_ROLE_KEY", "")
+    elif tier == "fallback":
+        url = os.getenv("VYNTRA_SOURCE_FALLBACK_SUPABASE_URL", "https://vbtreilxmstadnyotodb.supabase.co").rstrip("/")
+        key = os.getenv("VYNTRA_SOURCE_FALLBACK_SERVICE_ROLE_KEY", "")
+    else:
+        url, key = SUPABASE_URL, SERVICE_KEY
+    if not url or not key:
+        raise RuntimeError(f"source_storage_{tier}_not_configured")
+    return url, key
+
+
+def source_object_groups(object_paths: list[str]) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for path in dict.fromkeys(object_paths):
+        groups.setdefault(source_storage_tier(path), []).append(path)
+    return groups
+
+
+def source_storage_remove(object_paths: list[str]) -> None:
+    """Delete verified source objects from their owning private project."""
+    for tier, paths in source_object_groups(object_paths).items():
+        representative = paths[0]
+        storage_url, storage_key = source_storage_config(representative)
+        payload = json.dumps({"prefixes": paths}).encode()
+        request = urllib.request.Request(
+            storage_url + "/storage/v1/object/" + BUCKET,
+            data=payload,
+            headers={"apikey": storage_key, "Authorization": f"Bearer {storage_key}", "Content-Type": "application/json"},
+            method="DELETE",
+        )
+        with urllib.request.urlopen(request, timeout=90) as response:
+            response.read()
 
 def _verify_source_file(path: Path, object_path: str, expected_bytes: int | None, expected_sha256: str | None, manifest: dict, verified_parts: dict):
     expected = manifest.get(object_path)
@@ -397,16 +449,8 @@ def cleanup_source_objects(job):
     paths = list(dict.fromkeys(path for path in paths if isinstance(path, str) and path)) if isinstance(paths, list) else []
     if not paths:
         return False
-    payload = json.dumps({"prefixes": paths}).encode()
-    request = urllib.request.Request(
-        SUPABASE_URL + "/storage/v1/object/" + BUCKET,
-        data=payload,
-        headers={"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}", "Content-Type": "application/json"},
-        method="DELETE",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            response.read()
+        source_storage_remove(paths)
         update_job(job["id"], source_object_paths=[])
         print(f"removed {len(paths)} completed-job source objects", flush=True)
         return True
