@@ -276,6 +276,7 @@ class SourceStorageRoutingTests(unittest.TestCase):
     def test_legacy_and_new_source_paths_resolve_to_the_right_project(self):
         self.assertEqual(worker.source_storage_tier("owner-123/sources/legacy.mp4"), "primary")
         self.assertEqual(worker.source_storage_tier("owner-123/sources/secondary/id-video.mp4"), "secondary")
+        self.assertEqual(worker.source_storage_tier("owner-123/sources/tertiary/id-video.mp4"), "tertiary")
         self.assertEqual(worker.source_storage_tier("owner-123/sources/fallback/id-video.mp4"), "fallback")
 
     def test_secondary_and_fallback_credentials_are_selected_by_path(self):
@@ -284,24 +285,29 @@ class SourceStorageRoutingTests(unittest.TestCase):
             "VYNTRA_SOURCE_SECONDARY_SERVICE_ROLE_KEY": "secondary-key-test",
             "VYNTRA_SOURCE_FALLBACK_SUPABASE_URL": "https://fallback.example",
             "VYNTRA_SOURCE_FALLBACK_SERVICE_ROLE_KEY": "fallback-key-test",
+            "VYNTRA_SOURCE_FINAL_FALLBACK_SERVICE_ROLE_KEY": "final-fallback-key-test",
         }
         with patch.dict(os.environ, env):
             self.assertEqual(worker.source_storage_config("owner-123/sources/secondary/a.mp4"),
                              ("https://secondary.example", "secondary-key-test"))
-            self.assertEqual(worker.source_storage_config("owner-123/sources/fallback/a.mp4"),
+            self.assertEqual(worker.source_storage_config("owner-123/sources/tertiary/a.mp4"),
                              ("https://fallback.example", "fallback-key-test"))
+            self.assertEqual(worker.source_storage_config("owner-123/sources/fallback/a.mp4"),
+                             ("https://lrnugbbyrazzeculrqwe.supabase.co", "final-fallback-key-test"))
             self.assertEqual(worker.source_storage_config("owner-123/sources/legacy.mp4"),
                              (worker.SUPABASE_URL, worker.SERVICE_KEY))
 
     def test_cleanup_groups_mixed_source_parts_without_losing_path_identity(self):
         paths = [
             "owner-123/sources/secondary/a.mp4",
+            "owner-123/sources/tertiary/b.mp4",
             "owner-123/sources/fallback/b.mp4",
             "owner-123/sources/secondary/c.mp4",
             "owner-123/sources/legacy.mp4",
         ]
         self.assertEqual(worker.source_object_groups(paths), {
             "secondary": ["owner-123/sources/secondary/a.mp4", "owner-123/sources/secondary/c.mp4"],
+            "tertiary": ["owner-123/sources/tertiary/b.mp4"],
             "fallback": ["owner-123/sources/fallback/b.mp4"],
             "primary": ["owner-123/sources/legacy.mp4"],
         })

@@ -181,7 +181,7 @@ def source_storage_tier(object_path: str) -> str:
     primary project. New jobs use <owner>/sources/{secondary|fallback}/... .
     """
     parts = object_path.split("/")
-    if len(parts) >= 4 and parts[1] == "sources" and parts[2] in ("secondary", "fallback"):
+    if len(parts) >= 4 and parts[1] == "sources" and parts[2] in ("secondary", "tertiary", "fallback"):
         return parts[2]
     return "primary"
 
@@ -192,9 +192,12 @@ def source_storage_config(object_path: str) -> tuple[str, str]:
     if tier == "secondary":
         url = os.getenv("VYNTRA_SOURCE_SECONDARY_SUPABASE_URL", "https://vfaakmxoeflzedwidlcl.supabase.co").rstrip("/")
         key = os.getenv("VYNTRA_SOURCE_SECONDARY_SERVICE_ROLE_KEY") or os.getenv("VYNTRA_OUTPUT_SUPABASE_SERVICE_ROLE_KEY", "")
-    elif tier == "fallback":
+    elif tier == "tertiary":
         url = os.getenv("VYNTRA_SOURCE_FALLBACK_SUPABASE_URL", "https://vbtreilxmstadnyotodb.supabase.co").rstrip("/")
         key = os.getenv("VYNTRA_SOURCE_FALLBACK_SERVICE_ROLE_KEY", "")
+    elif tier == "fallback":
+        url = os.getenv("VYNTRA_SOURCE_FINAL_FALLBACK_SUPABASE_URL", "https://lrnugbbyrazzeculrqwe.supabase.co").rstrip("/")
+        key = os.getenv("VYNTRA_SOURCE_FINAL_FALLBACK_SERVICE_ROLE_KEY", "")
     else:
         url, key = SUPABASE_URL, SERVICE_KEY
     if not url or not key:
