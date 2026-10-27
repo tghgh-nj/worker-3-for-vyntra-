@@ -138,6 +138,27 @@ def update_job(job_id, **values):
 STAGE_COLUMN_AVAILABLE: bool | None = None
 
 
+COMPLETION_ERROR_CODES = {
+    "method_not_allowed", "server_not_configured", "worker_unauthorized", "invalid_json",
+    "output_manifest_invalid", "completion_unauthorized", "job_not_found",
+    "job_already_completed", "job_not_rendering", "source_receipt_required",
+    "release_repository_not_private", "release_not_found", "release_asset_verification_failed",
+    "release_validation_unavailable", "job_completion_record_failed", "job_completion_conflict",
+}
+
+
+def safe_completion_http_error(exc: urllib.error.HTTPError) -> str:
+    """Keep a known endpoint error code without logging its raw response body."""
+    try:
+        response = json.loads(exc.read(4096).decode("utf-8", errors="replace"))
+        code = response.get("error") if isinstance(response, dict) else None
+    except Exception:
+        code = None
+    if not isinstance(code, str) or code not in COMPLETION_ERROR_CODES:
+        code = "unrecognized_response"
+    return f"release_completion_http_{exc.code}:{code}"
+
+
 def report_render_completed(job, output_path: str, metadata: dict):
     """Let Supabase validate the private release asset before exposing completion."""
     job_id = str(uuid.UUID(str(job["id"])))
@@ -169,10 +190,11 @@ def report_render_completed(job, output_path: str, metadata: dict):
                 job.update(status="completed", progress=100, output_path=output_path, output_metadata=metadata)
                 return
         except urllib.error.HTTPError as exc:
+            completion_error = safe_completion_http_error(exc)
             if exc.code < 500 and exc.code != 429:
-                raise RuntimeError(f"release_completion_http_{exc.code}") from None
+                raise RuntimeError(completion_error) from None
             if attempt == 2:
-                raise RuntimeError(f"release_completion_http_{exc.code}") from None
+                raise RuntimeError(completion_error) from None
         except (urllib.error.URLError, TimeoutError, ConnectionError):
             if attempt == 2:
                 raise RuntimeError("release_completion_delivery_failed") from None
@@ -1551,6 +1573,9 @@ def main():
                     code = ffmpeg_error_code(message.partition(":")[2])
                 elif raw_code == "storage_upload_failed":
                     code = ("storage_upload_failed:" + ":".join(message.split(":")[1:]))[:100]
+                elif raw_code.startswith("release_completion_http_"):
+                    detail = message.partition(":")[2]
+                    code = f"{raw_code}:{detail}"[:100] if detail in COMPLETION_ERROR_CODES else raw_code
                 else:
                     code = raw_code
                 safe_message = safe_ffmpeg_diagnostic(message)

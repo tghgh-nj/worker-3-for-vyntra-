@@ -140,6 +140,26 @@ class JobProgressSchemaCompatibilityTests(unittest.TestCase):
         self.assertIsNone(worker.STAGE_COLUMN_AVAILABLE)
 
 
+class CompletionDiagnosticTests(unittest.TestCase):
+    def test_completion_http_error_keeps_known_response_code(self):
+        error = urllib.error.HTTPError(
+            "https://supabase.example/functions/v1/vyntra-render-complete",
+            400, "Bad Request", {}, io.BytesIO(b'{"error":"output_manifest_invalid"}'),
+        )
+        self.assertEqual(worker.safe_completion_http_error(error),
+                         "release_completion_http_400:output_manifest_invalid")
+        error.close()
+
+    def test_completion_http_error_does_not_log_unknown_response_text(self):
+        error = urllib.error.HTTPError(
+            "https://supabase.example/functions/v1/vyntra-render-complete",
+            400, "Bad Request", {}, io.BytesIO(b'{"error":"private token was invalid"}'),
+        )
+        self.assertEqual(worker.safe_completion_http_error(error),
+                         "release_completion_http_400:unrecognized_response")
+        error.close()
+
+
 class RenderLimitsTests(unittest.TestCase):
     def test_status_hd_defaults_to_three_minutes_and_fifty_mib(self):
         self.assertEqual(worker.MAX_DURATION, 180)
