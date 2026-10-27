@@ -41,6 +41,19 @@ class ESPCNGuardTests(unittest.TestCase):
 
 
 class AiEnhancementRoutingTests(unittest.TestCase):
+    def test_legacy_mmcv_build_uses_setuptools_with_pkg_resources(self):
+        self.assertIn("setuptools<82", worker.AI_BUILD_CONSTRAINTS.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(worker.subprocess, "run") as install:
+                worker.ensure_ai_model_runtime("basicvsr", Path(directory))
+            args = install.call_args.args[0]
+            self.assertIn("--build-constraint", args)
+            constraint_index = args.index("--build-constraint") + 1
+            self.assertEqual(Path(args[constraint_index]), worker.AI_BUILD_CONSTRAINTS)
+            runtime_path = args[args.index("--target") + 1]
+            if runtime_path in worker.sys.path:
+                worker.sys.path.remove(runtime_path)
+
     def test_every_advertised_model_has_a_worker_route(self):
         self.assertEqual(
             set(worker.SUPPORTED_AI_MODELS),

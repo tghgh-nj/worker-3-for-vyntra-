@@ -1,0 +1,2 @@
+# MMCV 2.1.0 imports pkg_resources in its build script. Setuptools removed it in 82.0.0.
+setuptools<82

@@ -31,6 +31,7 @@ AI_REQUIREMENTS_BY_MODEL = {
     "vrt": "requirements-vrt.txt",
     "basicvsr": "requirements-temporal.txt",
 }
+AI_BUILD_CONSTRAINTS = Path(__file__).with_name("requirements-ai-build-constraints.txt")
 ONESHOT = os.getenv("VYNTRA_ONESHOT", "false").lower() == "true"
 ENABLE_8K = os.getenv("VYNTRA_ENABLE_8K", "false").lower() == "true"
 MAX_JOBS = min(100, max(1, int(os.getenv("VYNTRA_MAX_CONCURRENT_JOBS", "100"))))
@@ -912,8 +913,12 @@ def ensure_ai_model_runtime(ai_model: str, runtime_root: Path | None = None) -> 
     requirements = Path(__file__).with_name(requirement_name)
     if not requirements.is_file():
         raise RuntimeError("ai_runtime_requirements_missing")
+    if not AI_BUILD_CONSTRAINTS.is_file():
+        raise RuntimeError("ai_runtime_build_constraints_missing")
     runtime_dir = (runtime_root or Path(tempfile.gettempdir()) / "vyntra-ai-runtime") / requirements.stem
-    requirements_hash = hashlib.sha256(requirements.read_bytes()).hexdigest()[:16]
+    requirements_hash = hashlib.sha256(
+        requirements.read_bytes() + AI_BUILD_CONSTRAINTS.read_bytes()
+    ).hexdigest()[:16]
     marker = runtime_dir / f".requirements-installed-{requirements_hash}"
     if runtime_dir.exists() and not marker.is_file():
         shutil.rmtree(runtime_dir)
@@ -922,7 +927,8 @@ def ensure_ai_model_runtime(ai_model: str, runtime_root: Path | None = None) -> 
         try:
             subprocess.run(
                 [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-                 "--no-cache-dir", "--target", str(runtime_dir), "-r", str(requirements)],
+                 "--no-cache-dir", "--build-constraint", str(AI_BUILD_CONSTRAINTS),
+                 "--target", str(runtime_dir), "-r", str(requirements)],
                 check=True, timeout=1200, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             )
         except subprocess.CalledProcessError as exc:
