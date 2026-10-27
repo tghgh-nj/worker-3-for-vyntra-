@@ -605,11 +605,14 @@ def _release_upload(source: Path, upload_url: str, asset_name: str, heartbeat=No
         connection.putheader("Content-Length", str(source.stat().st_size))
         connection.endheaders()
         last_heartbeat = time.monotonic()
+        sent_bytes = 0
+        total_bytes = source.stat().st_size
         with source.open("rb") as rendered:
             while chunk := rendered.read(1024 * 1024):
                 connection.send(chunk)
+                sent_bytes += len(chunk)
                 if heartbeat and time.monotonic() - last_heartbeat >= 15:
-                    heartbeat()
+                    heartbeat(sent_bytes, total_bytes)
                     last_heartbeat = time.monotonic()
         response = connection.getresponse()
         response_body = response.read()
@@ -672,7 +675,10 @@ def upload_output_release(source: Path, job, metadata: dict, work: Path) -> tupl
                 source,
                 release["upload_url"],
                 asset_name,
-                heartbeat=lambda: update_job(job_id, progress=98),
+                heartbeat=lambda sent, total: update_job(
+                    job_id, stage="uploading_release",
+                    progress=96 + int(2 * sent / max(total, 1)),
+                ),
             )
         except Exception:
             leftovers = _release_request(f"/releases/{release['id']}/assets") or []
@@ -705,7 +711,7 @@ def upload_output_release(source: Path, job, metadata: dict, work: Path) -> tupl
         "sha256": digest,
     }
     output_path = f"github-release:{release['id']}:{asset['id']}"
-    update_job(job_id, status="finalizing", progress=99, output_path=output_path, output_metadata=output_metadata)
+    update_job(job_id, status="finalizing", stage="finalizing", progress=99, output_path=output_path, output_metadata=output_metadata)
     job["output_path"] = output_path
     job["output_metadata"] = output_metadata
     current = api("/rest/v1/vyntra_render_jobs?id=eq." + urllib.parse.quote(job_id) + "&select=status")
@@ -983,6 +989,16 @@ def render(job, work: Path):
     source_dir = work / "verified_sources"
     source_dir.mkdir(parents=True, exist_ok=True)
     verified_parts = {}
+    update_job(job["id"], stage="downloading_sources", progress=1)
+    source_total_bytes = sum(item["bytes"] for item in (source_manifest or {}).values())
+
+    def report_source_progress():
+        if source_total_bytes <= 0:
+            return
+        verified_bytes = sum(item["bytes"] for item in verified_parts.values())
+        progress = 1 + int(7 * min(verified_bytes, source_total_bytes) / source_total_bytes)
+        update_job(job["id"], stage="downloading_sources", progress=min(8, progress))
+
     clip_sources = {}
     for index, clip in enumerate(clips):
         key = clip.get("path", "")
@@ -991,6 +1007,7 @@ def render(job, work: Path):
         path = source_dir / f"clip_{index}.source"
         download_source_asset(key, clip.get("sourceParts"), job["owner_id"], path, source_manifest, verified_parts)
         clip_sources[index] = path
+        report_source_progress()
     music_key = plan.get("musicPath")
     music_source = None
     if music_key:
@@ -998,6 +1015,7 @@ def render(job, work: Path):
             raise ValueError("media_not_owned")
         music_source = source_dir / "music.source"
         download_source_asset(music_key, plan.get("musicSourceParts"), job["owner_id"], music_source, source_manifest, verified_parts)
+        report_source_progress()
     image_sources = {}
     for index, overlay in enumerate(plan.get("imageOverlays", [])):
         key = overlay.get("path", "")
@@ -1009,9 +1027,13 @@ def render(job, work: Path):
         image_path = source_dir / f"image_overlay_{index}{suffix}"
         download_source_asset(key, overlay.get("sourceParts"), job["owner_id"], image_path, source_manifest, verified_parts)
         image_sources[index] = image_path
+        report_source_progress()
 
+    update_job(job["id"], stage="verifying_sources", progress=8)
     if source_manifest is not None:
         acknowledge_source_receipt(job, source_manifest, verified_parts)
+    source_complete_stage = "source_received" if source_manifest is not None else "sources_downloaded"
+    update_job(job["id"], stage=source_complete_stage, progress=9)
 
     local = []
     clip_lengths = []
@@ -1039,6 +1061,7 @@ def render(job, work: Path):
         if end <= start or end - start > MAX_DURATION: raise ValueError("invalid_trim_range")
         speed = safe_number(clip.get("speed", 1.0), .25, 4.0, "speed")
         if enhancement_mode != "normal":
+            update_job(job["id"], stage="ai_enhancement", progress=10)
             if media_type != "video":
                 raise ValueError("cloud_ai_photo_export_not_supported")
             try:
@@ -1055,11 +1078,15 @@ def render(job, work: Path):
                 upscale_video(
                     path, enhanced_path, source_width, source_height, source_fps, duration,
                     work / "espcn_x3.tflite",
-                    progress=lambda p, jid=job["id"]: update_job(jid, progress=p),
+                    progress=lambda p, jid=job["id"]: update_job(
+                        jid, stage="ai_enhancement", progress=10 + int(40 * p / 100),
+                    ),
                 )
                 ai_generated_dimensions = (source_width * 3, source_height * 3)
             else:
+                update_job(job["id"], stage="loading_ai_model", progress=10)
                 ensure_ai_model_runtime(ai_model)
+                update_job(job["id"], stage="ai_enhancement", progress=10)
                 if ai_model == "vrt":
                     from temporal_models import upscale_video
                     enhanced_path = work / "vrt_enhanced.mp4"
@@ -1379,7 +1406,8 @@ def render(job, work: Path):
         encoder_args += ["-b:v", f"{bitrate}k", "-maxrate", f"{int(bitrate * 1.25)}k", "-bufsize", f"{bitrate * 2}k"]
     cmd = input_args + ["-filter_complex", ";".join(filters), "-map", video_label, "-map", audio_label] + encoder_args + [
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)]
-    update_job(job["id"], status="processing", progress=10 if enhancement_mode != "normal" else 1, started_at=job.get("started_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    encode_start_progress = 50 if enhancement_mode != "normal" else 10
+    update_job(job["id"], status="processing", stage="encoding", progress=encode_start_progress, started_at=job.get("started_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     stderr_path = work / "ffmpeg.stderr"
     with stderr_path.open("w+b") as stderr_file:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_file, text=True, bufsize=1)
@@ -1389,8 +1417,8 @@ def render(job, work: Path):
             if line.startswith("out_time_ms="):
                 try:
                     done = int(line.split("=", 1)[1].strip()) // 1000
-                    progress = min(94, max(10 if enhancement_mode != "normal" else 1, int((10 if enhancement_mode != "normal" else 0) + done * (84 if enhancement_mode != "normal" else 94) / max(1, duration_ms))))
-                    update_job(job["id"], progress=progress)
+                    progress = min(94, max(encode_start_progress, int(encode_start_progress + done * (94 - encode_start_progress) / max(1, duration_ms))))
+                    update_job(job["id"], stage="encoding", progress=progress)
                 except ValueError: pass
             # Worker restarts and cancellation are observed through the job record.
             current = api("/rest/v1/vyntra_render_jobs?id=eq." + urllib.parse.quote(job["id"]) + "&select=status")
@@ -1405,6 +1433,7 @@ def render(job, work: Path):
         print("FFmpeg failed with exit code", proc.returncode, flush=True)
         print("FFmpeg diagnostic:", diagnostic or "[no diagnostic output]", flush=True)
         raise RuntimeError("ffmpeg_failed:" + diagnostic)
+    update_job(job["id"], stage="verifying_output", progress=95)
     meta = probe(out)
     video = next((s for s in meta.get("streams", []) if s.get("codec_type") == "video"), None)
     if not video or int(video.get("width", 0)) != width or int(video.get("height", 0)) != height:
@@ -1431,7 +1460,7 @@ def main():
                 time.sleep(POLL_SECONDS); continue
             stage = "prepare"
             try:
-                update_job(job["id"], status="processing", progress=0, worker_id=WORKER_ID)
+                update_job(job["id"], status="processing", stage="assigned", progress=0, worker_id=WORKER_ID)
                 old_output_metadata = job.get("output_metadata")
                 if isinstance(old_output_metadata, dict) and old_output_metadata.get("provider") == "github_release":
                     cleanup_release_output(job)
@@ -1446,7 +1475,7 @@ def main():
                     current = api("/rest/v1/vyntra_render_jobs?id=eq." + urllib.parse.quote(job["id"]) + "&select=status")
                     if current and current[0]["status"] == "cancel_requested":
                         raise InterruptedError("cancelled")
-                    update_job(job["id"], status="finalizing", progress=96)
+                    update_job(job["id"], status="finalizing", stage="uploading_release", progress=96)
                     stage = "upload_output_parts"
                     output_path, metadata = upload_output_release(output, job, metadata, Path(directory))
                     stage = "complete_job_record"
@@ -1456,7 +1485,7 @@ def main():
                     # so an output remains deliverable during storage outages.
                     cleanup_source_objects(job)
             except InterruptedError:
-                update_job(job["id"], status="cancelled", progress=0, completed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                update_job(job["id"], status="cancelled", stage="cancelled", progress=0, completed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
             except Exception as exc:
                 message = str(exc)
                 raw_code = message.split(":",1)[0][:80] or "render_failed"
@@ -1471,9 +1500,9 @@ def main():
                 print("job error summary:", safe_message or "[no diagnostic output]", flush=True)
                 retryable = is_retryable_job_error(job, exc, raw_code)
                 if int(job.get("attempts", 0)) < 3 and retryable:
-                    update_job(job["id"], status="queued", error_code=code, progress=0)
+                    update_job(job["id"], status="queued", stage="queued", error_code=code, progress=0)
                 else:
-                    update_job(job["id"], status="failed", error_code=code, progress=0, completed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                    update_job(job["id"], status="failed", stage="failed", error_code=code, progress=0, completed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
             if ONESHOT:
                 return
         except Exception as exc:
