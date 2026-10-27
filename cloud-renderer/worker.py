@@ -910,10 +910,11 @@ def resolve_ai_selection(plan: dict, clips: list, resolution: str) -> tuple[str,
         raise ValueError("unsupported_enhancement_mode")
     if mode != "normal" and model not in SUPPORTED_AI_MODELS:
         raise ValueError("ai_model_unavailable")
-    if mode == "ai" and resolution != "1440p":
-        raise ValueError("ai_only_supports_1440p")
-    if mode == "both" and resolution not in ("1440p", "2160p", "2880p", "3456p"):
-        raise ValueError("ai_resize_resolution_unavailable")
+    supported_resolutions = {"480p", "540p", "720p", "1080p", "1440p", "1620p", "2160p", "2880p", "3456p"}
+    if ENABLE_8K:
+        supported_resolutions.add("4320p")
+    if resolution not in supported_resolutions:
+        raise ValueError("ai_resolution_unavailable")
     if mode != "normal" and (len(clips) != 1 or clips[0].get("mediaType", "video") != "video"):
         raise ValueError("ai_requires_single_video_clip")
     return mode, model

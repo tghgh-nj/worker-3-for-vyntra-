@@ -46,11 +46,13 @@ class AiEnhancementRoutingTests(unittest.TestCase):
         )
         for model in worker.SUPPORTED_AI_MODELS:
             with self.subTest(model=model):
-                mode, selected = worker.resolve_ai_selection(
-                    {"enhancementMode": "ai", "aiModel": model},
-                    [{"mediaType": "video"}], "1440p",
-                )
-                self.assertEqual((mode, selected), ("ai", model))
+                for mode in ("ai", "both"):
+                    for resolution in ("720p", "1080p", "1440p", "2160p", "2880p", "3456p"):
+                        selected_mode, selected = worker.resolve_ai_selection(
+                            {"enhancementMode": mode, "aiModel": model},
+                            [{"mediaType": "video"}], resolution,
+                        )
+                        self.assertEqual((selected_mode, selected), (mode, model))
                 if model != "espcn":
                     requirements = Path(worker.__file__).with_name(worker.AI_REQUIREMENTS_BY_MODEL[model])
                     self.assertTrue(requirements.is_file())
@@ -70,11 +72,11 @@ class AiEnhancementRoutingTests(unittest.TestCase):
         self.assertEqual(args[-1], "enhanced.mp4")
         self.assertEqual(args.count("-i"), 1)
 
-    def test_ai_resolution_and_clip_limits_are_enforced(self):
-        with self.assertRaisesRegex(ValueError, "ai_only_supports_1440p"):
+    def test_ai_rejects_unknown_resolution_and_multiple_clips(self):
+        with self.assertRaisesRegex(ValueError, "ai_resolution_unavailable"):
             worker.resolve_ai_selection(
                 {"enhancementMode": "ai", "aiModel": "swinir"},
-                [{"mediaType": "video"}], "1080p",
+                [{"mediaType": "video"}], "999p",
             )
         with self.assertRaisesRegex(ValueError, "ai_requires_single_video_clip"):
             worker.resolve_ai_selection(
