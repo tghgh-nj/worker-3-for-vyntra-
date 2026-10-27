@@ -150,6 +150,15 @@ class CompletionDiagnosticTests(unittest.TestCase):
                          "release_completion_http_400:output_manifest_invalid")
         error.close()
 
+    def test_completion_http_error_keeps_safe_manifest_field_names(self):
+        error = urllib.error.HTTPError(
+            "https://supabase.example/functions/v1/vyntra-render-complete",
+            400, "Bad Request", {}, io.BytesIO(b'{"error":"output_manifest_invalid","fields":["repository","secret"]}'),
+        )
+        self.assertEqual(worker.safe_completion_http_error(error),
+                         "release_completion_http_400:output_manifest_invalid:repository")
+        error.close()
+
     def test_completion_http_error_does_not_log_unknown_response_text(self):
         error = urllib.error.HTTPError(
             "https://supabase.example/functions/v1/vyntra-render-complete",

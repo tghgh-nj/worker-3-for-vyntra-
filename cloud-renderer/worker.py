@@ -147,6 +147,12 @@ COMPLETION_ERROR_CODES = {
 }
 
 
+COMPLETION_MANIFEST_FIELDS = {
+    "job_id", "asset_id", "release_id", "bytes", "sha256", "provider",
+    "repository", "release_tag", "asset_name", "output_path",
+}
+
+
 def safe_completion_http_error(exc: urllib.error.HTTPError) -> str:
     """Keep a known endpoint error code without logging its raw response body."""
     try:
@@ -156,6 +162,12 @@ def safe_completion_http_error(exc: urllib.error.HTTPError) -> str:
         code = None
     if not isinstance(code, str) or code not in COMPLETION_ERROR_CODES:
         code = "unrecognized_response"
+    elif code == "output_manifest_invalid":
+        fields = response.get("fields", [])
+        if isinstance(fields, list):
+            safe_fields = sorted({field for field in fields if isinstance(field, str) and field in COMPLETION_MANIFEST_FIELDS})
+            if safe_fields:
+                code += ":" + ",".join(safe_fields)
     return f"release_completion_http_{exc.code}:{code}"
 
 
@@ -1575,7 +1587,14 @@ def main():
                     code = ("storage_upload_failed:" + ":".join(message.split(":")[1:]))[:100]
                 elif raw_code.startswith("release_completion_http_"):
                     detail = message.partition(":")[2]
-                    code = f"{raw_code}:{detail}"[:100] if detail in COMPLETION_ERROR_CODES else raw_code
+                    detail_parts = detail.split(":", 1)
+                    valid_detail = detail_parts[0] in COMPLETION_ERROR_CODES
+                    if valid_detail and len(detail_parts) == 2:
+                        fields = detail_parts[1].split(",")
+                        valid_detail = detail_parts[0] == "output_manifest_invalid" and all(
+                            field in COMPLETION_MANIFEST_FIELDS for field in fields
+                        )
+                    code = f"{raw_code}:{detail}"[:100] if valid_detail else raw_code
                 else:
                     code = raw_code
                 safe_message = safe_ffmpeg_diagnostic(message)
