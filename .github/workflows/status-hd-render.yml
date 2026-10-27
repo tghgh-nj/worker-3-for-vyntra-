@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   render:
-    if: github.event_name == 'push' || vars.VYNTRA_RENDER_WORKER_ENABLED == 'true'
+    if: github.event_name == 'push' || github.event_name == 'repository_dispatch' || vars.VYNTRA_RENDER_WORKER_ENABLED == 'true'
     name: Install FFmpeg and process one queued render
     runs-on: ubuntu-24.04
     timeout-minutes: 60
