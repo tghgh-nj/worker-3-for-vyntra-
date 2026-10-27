@@ -299,6 +299,23 @@ class SourceStorageRoutingTests(unittest.TestCase):
             self.assertEqual(worker.source_storage_config("owner-123/sources/legacy.mp4"),
                              (worker.SUPABASE_URL, worker.SERVICE_KEY))
 
+    def test_empty_optional_url_overrides_use_all_three_project_defaults(self):
+        env = {
+            "VYNTRA_SOURCE_SECONDARY_SUPABASE_URL": "",
+            "VYNTRA_SOURCE_SECONDARY_SERVICE_ROLE_KEY": "secondary-key-test",
+            "VYNTRA_SOURCE_FALLBACK_SUPABASE_URL": "",
+            "VYNTRA_SOURCE_FALLBACK_SERVICE_ROLE_KEY": "tertiary-key-test",
+            "VYNTRA_SOURCE_FINAL_FALLBACK_SUPABASE_URL": "",
+            "VYNTRA_SOURCE_FINAL_FALLBACK_SERVICE_ROLE_KEY": "final-fallback-key-test",
+        }
+        with patch.dict(os.environ, env):
+            self.assertEqual(worker.source_storage_config("owner-123/sources/secondary/a.mp4"),
+                ("https://vfaakmxoeflzedwidlcl.supabase.co", "secondary-key-test"))
+            self.assertEqual(worker.source_storage_config("owner-123/sources/tertiary/a.mp4"),
+                ("https://vbtreilxmstadnyotodb.supabase.co", "tertiary-key-test"))
+            self.assertEqual(worker.source_storage_config("owner-123/sources/fallback/a.mp4"),
+                ("https://lrnugbbyrazzeculrqwe.supabase.co", "final-fallback-key-test"))
+
     def test_cleanup_groups_mixed_source_parts_without_losing_path_identity(self):
         paths = [
             "owner-123/sources/secondary/a.mp4",

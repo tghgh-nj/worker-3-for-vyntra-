@@ -190,13 +190,13 @@ def source_storage_config(object_path: str) -> tuple[str, str]:
     """Resolve the Supabase project for a source object without trusting URLs."""
     tier = source_storage_tier(object_path)
     if tier == "secondary":
-        url = os.getenv("VYNTRA_SOURCE_SECONDARY_SUPABASE_URL", "https://vfaakmxoeflzedwidlcl.supabase.co").rstrip("/")
+        url = (os.getenv("VYNTRA_SOURCE_SECONDARY_SUPABASE_URL") or "https://vfaakmxoeflzedwidlcl.supabase.co").rstrip("/")
         key = os.getenv("VYNTRA_SOURCE_SECONDARY_SERVICE_ROLE_KEY") or os.getenv("VYNTRA_OUTPUT_SUPABASE_SERVICE_ROLE_KEY", "")
     elif tier == "tertiary":
-        url = os.getenv("VYNTRA_SOURCE_FALLBACK_SUPABASE_URL", "https://vbtreilxmstadnyotodb.supabase.co").rstrip("/")
+        url = (os.getenv("VYNTRA_SOURCE_FALLBACK_SUPABASE_URL") or "https://vbtreilxmstadnyotodb.supabase.co").rstrip("/")
         key = os.getenv("VYNTRA_SOURCE_FALLBACK_SERVICE_ROLE_KEY", "")
     elif tier == "fallback":
-        url = os.getenv("VYNTRA_SOURCE_FINAL_FALLBACK_SUPABASE_URL", "https://lrnugbbyrazzeculrqwe.supabase.co").rstrip("/")
+        url = (os.getenv("VYNTRA_SOURCE_FINAL_FALLBACK_SUPABASE_URL") or "https://lrnugbbyrazzeculrqwe.supabase.co").rstrip("/")
         key = os.getenv("VYNTRA_SOURCE_FINAL_FALLBACK_SERVICE_ROLE_KEY", "")
     else:
         url, key = SUPABASE_URL, SERVICE_KEY
