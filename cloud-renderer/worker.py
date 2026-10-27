@@ -71,9 +71,22 @@ def api(path: str, method="GET", payload=None, headers=None, raw=False):
     if not raw: h["Content-Type"] = "application/json"
     if headers: h.update(headers)
     req = urllib.request.Request(SUPABASE_URL + path, data=data, headers=h, method=method)
-    with urllib.request.urlopen(req, timeout=90) as response:
-        body = response.read()
-        return json.loads(body) if body and not raw else body
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            body = response.read()
+            return json.loads(body) if body and not raw else body
+    except urllib.error.HTTPError as exc:
+        # PostgREST's response body is the only reliable way to distinguish a
+        # schema-cache/column mismatch from an auth or constraint failure.
+        # Keep only its bounded, redacted diagnostic in runner logs.
+        try:
+            response_body = exc.read(4096).decode("utf-8", "replace")
+        except Exception:
+            response_body = ""
+        diagnostic = safe_ffmpeg_diagnostic(response_body)
+        exc.vyntra_diagnostic = diagnostic
+        print("Supabase REST request failed", exc.code, diagnostic or "[no response detail]", flush=True)
+        raise
 
 
 def is_retryable_job_error(job, exc, raw_code: str) -> bool:
@@ -91,8 +104,37 @@ def is_retryable_job_error(job, exc, raw_code: str) -> bool:
 def update_job(job_id, **values):
     # Refresh the lease on progress updates so a live FFmpeg render is not marked dead.
     values.setdefault("updated_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    api("/rest/v1/vyntra_render_jobs?id=eq." + urllib.parse.quote(job_id),
-        "PATCH", values, {"Prefer": "return=minimal"})
+    global STAGE_COLUMN_AVAILABLE
+    path = "/rest/v1/vyntra_render_jobs?id=eq." + urllib.parse.quote(job_id)
+    payload = dict(values)
+    if STAGE_COLUMN_AVAILABLE is False:
+        payload.pop("stage", None)
+    try:
+        api(path, "PATCH", payload, {"Prefer": "return=minimal"})
+    except urllib.error.HTTPError as exc:
+        diagnostic = getattr(exc, "vyntra_diagnostic", "")
+        missing_stage_column = (
+            "stage" in payload
+            and exc.code == 400
+            and "stage" in diagnostic.lower()
+            and (
+                ("column" in diagnostic.lower()
+                 and ("does not exist" in diagnostic.lower() or "could not find" in diagnostic.lower()))
+                or "pgrst204" in diagnostic.lower()
+            )
+        )
+        if not missing_stage_column:
+            raise
+        # Older databases may have the job table but not the optional progress
+        # stage migration yet. Status/progress updates must still work so a
+        # render (including AI inference) is not discarded before processing.
+        STAGE_COLUMN_AVAILABLE = False
+        payload.pop("stage", None)
+        print("Vyntra stage column is unavailable; continuing without detailed stage updates", flush=True)
+        api(path, "PATCH", payload, {"Prefer": "return=minimal"})
+
+
+STAGE_COLUMN_AVAILABLE: bool | None = None
 
 
 def report_render_completed(job, output_path: str, metadata: dict):
@@ -860,7 +902,7 @@ def output_dimensions(source_width: int, source_height: int, rotation: int, aspe
     return width, height
 
 
-def ensure_ai_model_runtime(ai_model: str) -> None:
+def ensure_ai_model_runtime(ai_model: str, runtime_root: Path | None = None) -> None:
     """Install heavyweight CPU inference packages only for jobs that need them."""
     requirement_name = AI_REQUIREMENTS_BY_MODEL.get(ai_model)
     if requirement_name is None:
@@ -870,7 +912,7 @@ def ensure_ai_model_runtime(ai_model: str) -> None:
     requirements = Path(__file__).with_name(requirement_name)
     if not requirements.is_file():
         raise RuntimeError("ai_runtime_requirements_missing")
-    runtime_dir = Path(tempfile.gettempdir()) / "vyntra-ai-runtime" / requirements.stem
+    runtime_dir = (runtime_root or Path(tempfile.gettempdir()) / "vyntra-ai-runtime") / requirements.stem
     requirements_hash = hashlib.sha256(requirements.read_bytes()).hexdigest()[:16]
     marker = runtime_dir / f".requirements-installed-{requirements_hash}"
     if runtime_dir.exists() and not marker.is_file():
@@ -962,6 +1004,16 @@ def render(job, work: Path):
         raise ValueError("unsupported_project_clip_count")
     resolution = job["resolution"]
     enhancement_mode, ai_model = resolve_ai_selection(plan, clips, resolution)
+    print(
+        "Vyntra render enhancement selection",
+        json.dumps({
+            "job_id": str(job.get("id", "")),
+            "mode": enhancement_mode,
+            "model": ai_model if enhancement_mode != "normal" else None,
+            "resolution": resolution,
+        }, separators=(",", ":")),
+        flush=True,
+    )
     edge = {"480p": 480, "540p": 540, "720p": 720, "1080p": 1080, "1440p": 1440, "1620p": 1620, "2160p": 2160, "2880p": 2880, "3456p": 3456, "4320p": 4320}.get(resolution)
     if edge is None: raise ValueError("unsupported_resolution")
     if resolution in ("2880p", "3456p", "4320p"):
@@ -1085,28 +1137,28 @@ def render(job, work: Path):
                 ai_generated_dimensions = (source_width * 3, source_height * 3)
             else:
                 update_job(job["id"], stage="loading_ai_model", progress=10)
-                ensure_ai_model_runtime(ai_model)
-                update_job(job["id"], stage="ai_enhancement", progress=10)
+                ensure_ai_model_runtime(ai_model, work / "ai-runtime")
+                update_job(job["id"], stage="ai_enhancement", progress=11)
                 if ai_model == "vrt":
                     from temporal_models import upscale_video
                     enhanced_path = work / "vrt_enhanced.mp4"
                     ai_generated_dimensions = upscale_video(
                         path, enhanced_path, source_width, source_height, source_fps, duration,
-                        Path(tempfile.gettempdir()) / "vyntra-model-cache" / "vrt",
+                        work / "model-cache" / "vrt",
                     )
                 elif ai_model == "basicvsr":
                     from temporal_models import upscale_basicvsr_video
                     enhanced_path = work / "basicvsr_enhanced.mp4"
                     ai_generated_dimensions = upscale_basicvsr_video(
                         path, enhanced_path, source_width, source_height, source_fps, duration,
-                        Path(tempfile.gettempdir()) / "vyntra-model-cache" / "basicvsr",
+                        work / "model-cache" / "basicvsr",
                     )
                 else:
                     from ai_image_models import upscale_video
                     enhanced_path = work / f"{ai_model}_enhanced.mp4"
                     ai_generated_dimensions = upscale_video(
                         path, enhanced_path, ai_model, source_width, source_height, source_fps, duration,
-                        Path(tempfile.gettempdir()) / "vyntra-model-cache",
+                        work / "model-cache",
                     )
             path = enhanced_path
             meta = probe(path)

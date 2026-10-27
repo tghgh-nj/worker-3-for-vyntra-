@@ -1,10 +1,12 @@
 import json
 import hashlib
+import io
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -83,6 +85,46 @@ class AiEnhancementRoutingTests(unittest.TestCase):
                 {"enhancementMode": "both", "aiModel": "vrt"},
                 [{"mediaType": "video"}, {"mediaType": "video"}], "2160p",
             )
+
+
+class JobProgressSchemaCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        worker.STAGE_COLUMN_AVAILABLE = None
+
+    def tearDown(self):
+        worker.STAGE_COLUMN_AVAILABLE = None
+
+    def test_missing_optional_stage_column_retries_status_update_without_stage(self):
+        missing_column = urllib.error.HTTPError(
+            "https://supabase.example/rest/v1/vyntra_render_jobs",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"code":"PGRST204","message":"Could not find the \'stage\' column in the schema cache"}'),
+        )
+        missing_column.vyntra_diagnostic = "PGRST204: Could not find the 'stage' column in the schema cache"
+        with patch.object(worker, "api", side_effect=[missing_column, None]) as api:
+            worker.update_job("job-123", status="processing", stage="assigned", progress=0)
+
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_args.args[2]["status"], "processing")
+        self.assertNotIn("stage", api.call_args.args[2])
+        self.assertFalse(worker.STAGE_COLUMN_AVAILABLE)
+
+    def test_non_schema_http_400_is_not_hidden_by_progress_fallback(self):
+        invalid_status = urllib.error.HTTPError(
+            "https://supabase.example/rest/v1/vyntra_render_jobs",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"code":"23514","message":"status check constraint failed"}'),
+        )
+        invalid_status.vyntra_diagnostic = "23514: status check constraint failed"
+        with patch.object(worker, "api", side_effect=invalid_status) as api:
+            with self.assertRaises(urllib.error.HTTPError):
+                worker.update_job("job-123", status="not-a-status", stage="assigned")
+        api.assert_called_once()
+        self.assertIsNone(worker.STAGE_COLUMN_AVAILABLE)
 
 
 class RenderLimitsTests(unittest.TestCase):

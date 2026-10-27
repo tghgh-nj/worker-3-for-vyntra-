@@ -32,7 +32,7 @@ def main() -> None:
             expected = (192, 192)
             upscale_video(source, output, 64, 64, 24.0, 0.25, root / "espcn.tflite")
         else:
-            worker.ensure_ai_model_runtime(model)
+            worker.ensure_ai_model_runtime(model, root / "ai-runtime")
             if model in ("edsr", "swinir", "realesrgan"):
                 from ai_image_models import upscale_video
                 expected = upscale_video(source, output, model, 64, 64, 24.0, 0.25, root / "model-cache")
