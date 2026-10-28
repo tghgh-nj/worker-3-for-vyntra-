@@ -71,6 +71,12 @@ WEIGHTS = {
         "filename": "RealESRGAN_x4plus.pth",
         "sha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
     },
+    # Official compact Real-ESRGAN general-scenes x4v3 checkpoint.
+    "realesrgan_x4v3": {
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+        "filename": "realesr-general-x4v3.pth",
+        "sha256": "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292",
+    },
     # OmniSR X4 is an Apache-2.0 lightweight transformer checkpoint. Safetensors
     # avoids pickle-based model deserialization and the commit pins the asset.
     "omnisr": {
@@ -99,6 +105,12 @@ WEIGHTS = {
         "url": "https://huggingface.co/Acly/hat/resolve/8403819bcbf5959d54c72383f0725f2525472d30/Real_HAT_GAN_sharper.pth",
         "filename": "Real_HAT_GAN_sharper.pth",
         "sha256": "5800b67136006eb8cab3b4ed7c8d73b6a195bb18e6cc709b674f9aa069c00271",
+    },
+    # SAFMN-L Real x4, pinned to a specific Hugging Face revision and digest.
+    "safmn": {
+        "url": "https://huggingface.co/Meloo/SAFMN/resolve/de1a78865a10cdd810a60c8e0313e5f81be49119/SAFMN_L_Real_x4.pth",
+        "filename": "SAFMN_L_Real_x4.pth",
+        "sha256": "f1ac0ee3ee143fbbc49aff6584cb7b48b71ba8d1961dfb8ad076b98ca4799ae2",
     },
 }
 
@@ -185,6 +197,7 @@ def _load_model(model_id: str, cache: Path, heartbeat: Callable[[], None] | None
 def _infer_image(torch, model, source: Image.Image, scale: int,
                  heartbeat: Callable[[], None] | None = None,
                  progress: Callable[[float], None] | None = None,
+                 tile_progress: Callable[[int, int, float], None] | None = None,
                  device=None) -> Image.Image:
     if source.width * source.height > MAX_IMAGE_PIXELS:
         raise ValueError("ai_image_pixel_limit")
@@ -197,6 +210,7 @@ def _infer_image(torch, model, source: Image.Image, scale: int,
     tiles_x = (width + TILE - 1) // TILE
     tiles_y = (height + TILE - 1) // TILE
     completed_tiles = 0
+    inference_started = time.monotonic()
     with torch.inference_mode():
         for core_y in range(0, height, TILE):
             for core_x in range(0, width, TILE):
@@ -215,6 +229,8 @@ def _infer_image(torch, model, source: Image.Image, scale: int,
                 completed_tiles += 1
                 if progress:
                     progress(completed_tiles / (tiles_x * tiles_y))
+                if tile_progress:
+                    tile_progress(completed_tiles, tiles_x * tiles_y, time.monotonic() - inference_started)
                 if heartbeat and time.monotonic() - last_heartbeat >= 5:
                     heartbeat()
                     last_heartbeat = time.monotonic()
@@ -223,13 +239,14 @@ def _infer_image(torch, model, source: Image.Image, scale: int,
 
 def upscale_image(source: Path, destination: Path, model_id: str, cache: Path,
                   heartbeat: Callable[[], None] | None = None,
-                  progress: Callable[[float], None] | None = None) -> tuple[int, int]:
+                  progress: Callable[[float], None] | None = None,
+                  tile_progress: Callable[[int, int, float], None] | None = None) -> tuple[int, int]:
     with Image.open(source) as opened:
         image = opened.convert("RGB")
     if image.width * image.height > MAX_IMAGE_PIXELS:
         raise ValueError("ai_image_pixel_limit")
     torch, model, scale, device = _load_model(model_id, cache, heartbeat)
-    enhanced = _infer_image(torch, model, image, scale, heartbeat, progress, device)
+    enhanced = _infer_image(torch, model, image, scale, heartbeat, progress, tile_progress, device)
     enhanced.save(destination, format="PNG")
     return enhanced.size
 
@@ -251,7 +268,8 @@ def _read_exact(stream, size: int) -> bytes:
 def upscale_video(source: Path, destination: Path, model_id: str, width: int,
                   height: int, fps: float, duration: float, cache: Path,
                   progress: Callable[[float], None] | None = None,
-                  heartbeat: Callable[[], None] | None = None) -> tuple[int, int]:
+                  heartbeat: Callable[[], None] | None = None,
+                  frame_progress: Callable[[int, int, float], None] | None = None) -> tuple[int, int]:
     """Enhance every decoded frame with an image model; preserve source audio."""
     if width < 1 or height < 1 or max(width, height) > MAX_VIDEO_SOURCE_LONG_EDGE or min(width, height) > MAX_VIDEO_SOURCE_SHORT_EDGE:
         raise ValueError("ai_video_source_must_be_1080p_or_lower")
@@ -300,6 +318,8 @@ def upscale_video(source: Path, destination: Path, model_id: str, width: int,
                 raise RuntimeError("ai_video_encoder_failed") from exc
             processed_frames += 1
             now = time.monotonic()
+            if frame_progress:
+                frame_progress(processed_frames, expected_frames, now - last_report)
             if progress and (
                 processed_frames - last_progress_frame >= max(1, round(fps * 5))
                 or processed_frames >= expected_frames

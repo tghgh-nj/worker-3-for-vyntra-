@@ -66,7 +66,7 @@ def load_model(model_path: Path, heartbeat=None):
     return interpreter, input_detail["index"], output_detail["index"]
 
 
-def upscale_image(source: Path, destination: Path, model_path: Path, heartbeat=None, progress=None) -> None:
+def upscale_image(source: Path, destination: Path, model_path: Path, heartbeat=None, progress=None, tile_progress=None) -> None:
     """Enhance one still image with ESPCN and save the actual 3x image result."""
     image = Image.open(source).convert("RGB")
     width, height = image.size
@@ -78,6 +78,7 @@ def upscale_image(source: Path, destination: Path, model_path: Path, heartbeat=N
         enlarged = np.empty((height * SCALE, width * SCALE, 3), dtype=np.uint8)
         tile_count = max(1, ((height + TILE - 1) // TILE) * ((width + TILE - 1) // TILE))
         completed_tiles = 0
+        inference_started = time.monotonic()
         last_heartbeat = time.monotonic()
         for top in range(0, height, TILE):
             tile_h = min(TILE, height - top)
@@ -97,6 +98,7 @@ def upscale_image(source: Path, destination: Path, model_path: Path, heartbeat=N
                 enlarged[top*SCALE:(top+tile_h)*SCALE, left*SCALE:(left+tile_w)*SCALE] = rgb
                 completed_tiles += 1
                 if progress: progress(completed_tiles / tile_count)
+                if tile_progress: tile_progress(completed_tiles, tile_count, time.monotonic() - inference_started)
                 if heartbeat and time.monotonic() - last_heartbeat >= 5:
                     heartbeat()
                     last_heartbeat = time.monotonic()
@@ -120,7 +122,8 @@ def _read_exact(stream, size: int) -> bytes:
 
 
 def upscale_video(source: Path, destination: Path, width: int, height: int,
-                  fps: float, duration: float, model_path: Path, progress=None, heartbeat=None) -> None:
+                  fps: float, duration: float, model_path: Path, progress=None, heartbeat=None,
+                  frame_progress=None) -> None:
     """Run ESPCN on every source frame, then retain source audio in an MP4."""
     validate_espcn_source(width, height, fps, duration)
     interpreter, input_index, output_index = load_model(model_path, heartbeat)
@@ -170,6 +173,8 @@ def upscale_video(source: Path, destination: Path, width: int, height: int,
                     enlarged[top*SCALE:(top+tile_h)*SCALE, left*SCALE:(left+tile_w)*SCALE] = rgb
             encoder.stdin.write(enlarged.tobytes())
             frame_index += 1
+            if frame_progress:
+                frame_progress(frame_index, expected_frames, time.monotonic() - last_heartbeat)
             if progress and (frame_index % 8 == 0 or frame_index == expected_frames):
                 progress(min(10, max(1, int(frame_index * 10 / expected_frames))))
             if heartbeat and time.monotonic() - last_heartbeat >= 5:

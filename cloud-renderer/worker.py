@@ -24,8 +24,8 @@ RELEASE_TTL_HOURS = min(168, max(1, int(os.getenv("VYNTRA_RELEASE_TTL_HOURS", "6
 RELEASE_REPOSITORY = os.getenv("VYNTRA_RELEASE_REPOSITORY", "fasmora-continue/here")
 RELEASE_TOKEN = os.getenv("VYNTRA_RELEASE_TOKEN", "")
 SUPPORTED_AI_MODELS = (
-    "espcn", "edsr", "swinir", "realesrgan", "omnisr", "omnisr2", "bsrgan", "hat", "realhat",
-    "basicvsr", "vrt",
+    "espcn", "edsr", "swinir", "realesrgan", "realesrgan_x4v3", "omnisr", "omnisr2", "bsrgan", "hat", "realhat",
+    "safmn", "basicvsr", "vrt",
 )
 AI_PHOTO_ONLY_MODELS = {"hat", "realhat"}
 AI_TEMPORAL_MODELS = {"basicvsr", "vrt"}
@@ -39,10 +39,12 @@ AI_MODEL_SCALES = {
     "edsr": 4,
     "swinir": 4,
     "realesrgan": 4,
+    "realesrgan_x4v3": 4,
     "omnisr": 4,
     "bsrgan": 4,
     "hat": 4,
     "realhat": 4,
+    "safmn": 4,
     "basicvsr": 4,
     "vrt": 4,
 }
@@ -50,11 +52,13 @@ AI_REQUIREMENTS_BY_MODEL = {
     "edsr": "requirements-ai-image.txt",
     "swinir": "requirements-ai-image.txt",
     "realesrgan": "requirements-ai-image.txt",
+    "realesrgan_x4v3": "requirements-ai-image.txt",
     "omnisr": "requirements-ai-image.txt",
     "omnisr2": "requirements-ai-image.txt",
     "bsrgan": "requirements-ai-image.txt",
     "hat": "requirements-ai-image.txt",
     "realhat": "requirements-ai-image.txt",
+    "safmn": "requirements-ai-image.txt",
     "vrt": "requirements-vrt.txt",
     "basicvsr": "requirements-temporal.txt",
 }
@@ -63,6 +67,8 @@ ONESHOT = os.getenv("VYNTRA_ONESHOT", "false").lower() == "true"
 ENABLE_8K = os.getenv("VYNTRA_ENABLE_8K", "false").lower() == "true"
 MAX_JOBS = min(100, max(1, int(os.getenv("VYNTRA_MAX_CONCURRENT_JOBS", "100"))))
 MAX_JOBS_PER_REPOSITORY = min(20, max(1, int(os.getenv("VYNTRA_MAX_JOBS_PER_REPOSITORY", "20"))))
+AI_PROCESSING_TIMEOUT_SECONDS = min(3600, max(300, int(os.getenv("VYNTRA_AI_PROCESSING_TIMEOUT_SECONDS", "1200"))))
+JOB_PROCESSING_TIMEOUT_SECONDS = min(5400, max(600, int(os.getenv("VYNTRA_JOB_PROCESSING_TIMEOUT_SECONDS", "2700"))))
 
 def safe_ffmpeg_diagnostic(stderr: str, work_dir: Path | None = None) -> str:
     """Return a bounded FFmpeg diagnostic with secrets, URLs, and temp paths removed."""
@@ -121,6 +127,8 @@ def is_retryable_job_error(job, exc, raw_code: str) -> bool:
     """Jobs whose receipt deleted their remote inputs cannot be requeued safely."""
     if job.get("source_cleanup_completed_at"):
         return False
+    if raw_code in {"ai_processing_timeout", "job_processing_timeout"}:
+        return False
     http_status = getattr(getattr(exc, "response", None), "status_code", None)
     transient_http = http_status is None or http_status >= 500 or http_status == 429
     return (
@@ -131,35 +139,53 @@ def is_retryable_job_error(job, exc, raw_code: str) -> bool:
 
 def update_job(job_id, **values):
     # Refresh the lease on progress updates so a live FFmpeg render is not marked dead.
+    if "stage" in values and values.get("stage") != "ai_enhancement":
+        values.setdefault("progress_detail", None)
+        values.setdefault("estimated_remaining_seconds", None)
     values.setdefault("updated_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    global STAGE_COLUMN_AVAILABLE
+    started = JOB_STARTED_MONOTONIC.get(job_id)
+    terminal = values.get("status") in {"failed", "cancelled", "completed"} or values.get("stage") in {"failed", "cancelled", "completed"}
+    if started is not None and not terminal and time.monotonic() - started > JOB_PROCESSING_TIMEOUT_SECONDS:
+        raise TimeoutError("job_processing_timeout")
+    ai_started = AI_STARTED_MONOTONIC.get(job_id)
+    if ai_started is not None and not terminal and time.monotonic() - ai_started > AI_PROCESSING_TIMEOUT_SECONDS:
+        raise TimeoutError("ai_processing_timeout")
+    if values.get("stage") == "ai_enhancement":
+        AI_STARTED_MONOTONIC.setdefault(job_id, time.monotonic())
+    elif values.get("stage") is not None:
+        AI_STARTED_MONOTONIC.pop(job_id, None)
+    global STAGE_COLUMN_AVAILABLE, PROGRESS_DETAIL_COLUMN_AVAILABLE, PROGRESS_ETA_COLUMN_AVAILABLE
     path = "/rest/v1/vyntra_render_jobs?id=eq." + urllib.parse.quote(job_id)
     payload = dict(values)
     if STAGE_COLUMN_AVAILABLE is False:
         payload.pop("stage", None)
-    try:
-        api(path, "PATCH", payload, {"Prefer": "return=minimal"})
-    except urllib.error.HTTPError as exc:
-        diagnostic = getattr(exc, "vyntra_diagnostic", "")
-        missing_stage_column = (
-            "stage" in payload
-            and exc.code == 400
-            and "stage" in diagnostic.lower()
-            and (
-                ("column" in diagnostic.lower()
-                 and ("does not exist" in diagnostic.lower() or "could not find" in diagnostic.lower()))
-                or "pgrst204" in diagnostic.lower()
-            )
-        )
-        if not missing_stage_column:
-            raise
-        # Older databases may have the job table but not the optional progress
-        # stage migration yet. Status/progress updates must still work so a
-        # render (including AI inference) is not discarded before processing.
-        STAGE_COLUMN_AVAILABLE = False
-        payload.pop("stage", None)
-        print("Vyntra stage column is unavailable; continuing without detailed stage updates", flush=True)
-        api(path, "PATCH", payload, {"Prefer": "return=minimal"})
+    if PROGRESS_DETAIL_COLUMN_AVAILABLE is False:
+        payload.pop("progress_detail", None)
+    if PROGRESS_ETA_COLUMN_AVAILABLE is False:
+        payload.pop("estimated_remaining_seconds", None)
+    while True:
+        try:
+            api(path, "PATCH", payload, {"Prefer": "return=minimal"})
+            return
+        except urllib.error.HTTPError as exc:
+            diagnostic = getattr(exc, "vyntra_diagnostic", "").lower()
+            missing_column = next((column for column in (
+                "stage", "progress_detail", "estimated_remaining_seconds",
+            ) if column in payload and column in diagnostic and (
+                "pgrst204" in diagnostic or "could not find" in diagnostic or "does not exist" in diagnostic
+            )), None)
+            if exc.code != 400 or missing_column is None:
+                raise
+            # Optional UI progress columns may not have been migrated yet. Drop
+            # only the unavailable field and retry the actual job update.
+            if missing_column == "stage":
+                STAGE_COLUMN_AVAILABLE = False
+            elif missing_column == "progress_detail":
+                PROGRESS_DETAIL_COLUMN_AVAILABLE = False
+            else:
+                PROGRESS_ETA_COLUMN_AVAILABLE = False
+            payload.pop(missing_column, None)
+            print(f"Vyntra optional progress column {missing_column} is unavailable; continuing", flush=True)
 
 
 def check_job_cancelled(job_id):
@@ -174,8 +200,11 @@ def ai_job_progress_callback(job_id, base: int = 11, span: int = 38, stage: str 
     last_progress = [base - 1]
     last_update = [0.0]
     last_cancel_check = [time.monotonic()]
+    started = last_cancel_check[0]
 
     def report(value):
+        if time.monotonic() - started > AI_PROCESSING_TIMEOUT_SECONDS:
+            raise TimeoutError("ai_processing_timeout")
         fraction = max(0.0, min(1.0, float(value)))
         progress = base + int(span * fraction)
         now = time.monotonic()
@@ -195,7 +224,52 @@ def ai_percent_progress_callback(job_id, base: int = 10, span: int = 40, divisor
     return lambda percentage: normalized(float(percentage) / divisor)
 
 
+def ai_job_frame_progress_callback(job_id, base: int = 11, span: int = 38, unit: str = "AI frame"):
+    """Persist measured frame counts and a rolling, approximate AI-stage ETA."""
+    inference_started = [None]
+    last_update = [0.0]
+    last_progress = [base - 1]
+    last_cancel_check = [time.monotonic()]
+
+    def report(frame: int, total: int, _elapsed_since_report: float = 0.0):
+        total = max(1, int(total))
+        frame = max(0, min(int(frame), total))
+        now = time.monotonic()
+        if inference_started[0] is None:
+            inference_started[0] = now
+        fraction = frame / total
+        progress = base + int(span * fraction)
+        elapsed = max(0.1, now - inference_started[0])
+        remaining = round((elapsed / frame) * (total - frame)) if frame >= 3 else None
+        if progress > last_progress[0] or now - last_update[0] >= 5 or frame >= total:
+            update_job(
+                job_id,
+                stage="ai_enhancement",
+                progress=progress,
+                progress_detail=f"{unit} {frame:,} of {total:,}",
+                estimated_remaining_seconds=remaining,
+            )
+            last_progress[0] = max(last_progress[0], progress)
+            last_update[0] = now
+        if now - last_cancel_check[0] >= 5:
+            check_job_cancelled(job_id)
+            last_cancel_check[0] = now
+
+    return report
+
+
+def ai_fraction_frame_progress_callback(job_id, total_frames: int, base: int = 11, span: int = 38, unit: str = "AI frame"):
+    """Translate a model's measured emitted-frame fraction to frame counts."""
+    total = max(1, int(total_frames))
+    measured = ai_job_frame_progress_callback(job_id, base=base, span=span, unit=unit)
+    return lambda fraction: measured(round(max(0.0, min(1.0, float(fraction))) * total), total)
+
+
 STAGE_COLUMN_AVAILABLE: bool | None = None
+PROGRESS_DETAIL_COLUMN_AVAILABLE: bool | None = None
+PROGRESS_ETA_COLUMN_AVAILABLE: bool | None = None
+JOB_STARTED_MONOTONIC: dict[str, float] = {}
+AI_STARTED_MONOTONIC: dict[str, float] = {}
 
 
 COMPLETION_ERROR_CODES = {
@@ -1428,6 +1502,7 @@ def render(job, work: Path):
                         path, enhanced_path, work / "espcn_x3.tflite",
                         heartbeat=lambda jid=job["id"]: update_job(jid, stage="ai_enhancement"),
                         progress=ai_job_progress_callback(job["id"], base=10, span=40),
+                        tile_progress=ai_job_frame_progress_callback(job["id"], base=10, span=40, unit=f"{active_ai_model.upper()} tile"),
                     )
                     ai_generated_dimensions = (source_width * 3, source_height * 3)
                 elif active_ai_model in AI_TEMPORAL_MODELS:
@@ -1443,6 +1518,7 @@ def render(job, work: Path):
                         path, enhanced_path, active_ai_model, work / "model-cache",
                         heartbeat=lambda jid=job["id"]: update_job(jid, stage="ai_enhancement"),
                         progress=ai_job_progress_callback(job["id"]),
+                        tile_progress=ai_job_frame_progress_callback(job["id"], unit=f"{active_ai_model.upper()} tile"),
                     )
             else:
                 try:
@@ -1458,6 +1534,7 @@ def render(job, work: Path):
                         work / "espcn_x3.tflite",
                         progress=ai_percent_progress_callback(job["id"], divisor=10),
                         heartbeat=lambda jid=job["id"]: update_job(jid, stage="ai_enhancement"),
+                        frame_progress=ai_job_frame_progress_callback(job["id"], unit="ESPCN frame"),
                     )
                     ai_generated_dimensions = (source_width * 3, source_height * 3)
                 else:
@@ -1472,7 +1549,7 @@ def render(job, work: Path):
                         ai_generated_dimensions = upscale_video(
                             path, enhanced_path, source_width, source_height, source_fps, duration,
                             work / "model-cache" / "vrt",
-                            progress=ai_job_progress_callback(job["id"]),
+                            progress=ai_fraction_frame_progress_callback(job["id"], round(source_fps * duration), unit="VRT frame"),
                             heartbeat=lambda jid=job["id"]: update_job(
                                 jid, stage="ai_enhancement",
                             ),
@@ -1483,7 +1560,7 @@ def render(job, work: Path):
                         ai_generated_dimensions = upscale_basicvsr_video(
                             path, enhanced_path, source_width, source_height, source_fps, duration,
                             work / "model-cache" / "basicvsr",
-                            progress=ai_job_progress_callback(job["id"]),
+                            progress=ai_fraction_frame_progress_callback(job["id"], round(source_fps * duration), unit="BasicVSR++ frame"),
                             heartbeat=lambda jid=job["id"]: update_job(
                                 jid, stage="ai_enhancement",
                             ),
@@ -1495,6 +1572,7 @@ def render(job, work: Path):
                             path, enhanced_path, active_ai_model, source_width, source_height, source_fps, duration,
                             work / "model-cache",
                             progress=ai_job_progress_callback(job["id"]),
+                            frame_progress=ai_job_frame_progress_callback(job["id"], unit=f"{active_ai_model.upper()} frame"),
                             heartbeat=lambda jid=job["id"]: update_job(
                                 jid, stage="ai_enhancement",
                             ),
@@ -1849,6 +1927,7 @@ def main():
                     print("No queued Vyntra render jobs", flush=True)
                     return
                 time.sleep(POLL_SECONDS); continue
+            JOB_STARTED_MONOTONIC[job["id"]] = time.monotonic()
             stage = "prepare"
             try:
                 update_job(job["id"], status="processing", stage="assigned", progress=0, worker_id=WORKER_ID)
@@ -1904,6 +1983,8 @@ def main():
                     update_job(job["id"], status="queued", stage="queued", error_code=code, progress=0)
                 else:
                     update_job(job["id"], status="failed", stage="failed", error_code=code, progress=0, completed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+            JOB_STARTED_MONOTONIC.pop(job["id"], None)
+            AI_STARTED_MONOTONIC.pop(job["id"], None)
             if ONESHOT:
                 return
         except Exception as exc:
