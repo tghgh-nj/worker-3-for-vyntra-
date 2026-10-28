@@ -162,6 +162,28 @@ def update_job(job_id, **values):
         api(path, "PATCH", payload, {"Prefer": "return=minimal"})
 
 
+def ai_job_progress_callback(job_id, base: int = 11, span: int = 38, stage: str = "ai_enhancement"):
+    """Throttle tile/frame progress writes while preserving monotonic progress."""
+    last_progress = [base - 1]
+    last_update = [0.0]
+
+    def report(value):
+        fraction = max(0.0, min(1.0, float(value)))
+        progress = base + int(span * fraction)
+        now = time.monotonic()
+        if progress > last_progress[0] or fraction >= 1.0 or now - last_update[0] >= 10:
+            update_job(job_id, stage=stage, progress=progress)
+            last_progress[0] = max(last_progress[0], progress)
+            last_update[0] = now
+
+    return report
+
+
+def ai_percent_progress_callback(job_id, base: int = 10, span: int = 40, divisor: int = 100):
+    normalized = ai_job_progress_callback(job_id, base=base, span=span)
+    return lambda percentage: normalized(float(percentage) / divisor)
+
+
 STAGE_COLUMN_AVAILABLE: bool | None = None
 
 
@@ -969,7 +991,11 @@ def output_dimensions(source_width: int, source_height: int, rotation: int, aspe
     return width, height
 
 
-def ensure_ai_model_runtime(ai_model: str, runtime_root: Path | None = None) -> None:
+def ensure_ai_model_runtime(
+    ai_model: str,
+    runtime_root: Path | None = None,
+    heartbeat=None,
+) -> None:
     """Install heavyweight CPU inference packages only for jobs that need them."""
     requirement_name = AI_REQUIREMENTS_BY_MODEL.get(ai_model)
     if requirement_name is None:
@@ -990,19 +1016,33 @@ def ensure_ai_model_runtime(ai_model: str, runtime_root: Path | None = None) -> 
         shutil.rmtree(runtime_dir)
     runtime_dir.mkdir(parents=True, exist_ok=True)
     if not marker.is_file():
+        command = [
+            sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+            "--no-cache-dir", "--build-constraint", str(AI_BUILD_CONSTRAINTS),
+            "--target", str(runtime_dir), "-r", str(requirements),
+        ]
+        install_log_path = runtime_dir / ".install.log"
         try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-                 "--no-cache-dir", "--build-constraint", str(AI_BUILD_CONSTRAINTS),
-                 "--target", str(runtime_dir), "-r", str(requirements)],
-                check=True, timeout=1200, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            shutil.rmtree(runtime_dir, ignore_errors=True)
-            raise RuntimeError("ai_runtime_install_failed:" + (exc.stdout or "")[-400:]) from exc
-        except Exception:
+            with install_log_path.open("w+b") as install_log:
+                process = subprocess.Popen(command, stdout=install_log, stderr=subprocess.STDOUT)
+                started_at = time.monotonic()
+                while process.poll() is None:
+                    if time.monotonic() - started_at >= 1200:
+                        process.kill()
+                        process.wait()
+                        raise TimeoutError("ai_runtime_install_timeout")
+                    if heartbeat:
+                        heartbeat()
+                    time.sleep(10)
+                if process.returncode != 0:
+                    install_log.flush()
+                    install_log.seek(max(0, install_log.tell() - 400))
+                    detail = install_log.read().decode("utf-8", errors="replace")[-400:]
+                    raise RuntimeError("ai_runtime_install_failed:" + detail)
+        except Exception as exc:
             shutil.rmtree(runtime_dir, ignore_errors=True)
             raise
+        install_log_path.unlink(missing_ok=True)
         marker.touch()
     runtime_path = str(runtime_dir)
     if runtime_path not in sys.path:
@@ -1135,15 +1175,25 @@ def render_still_image(job, source: Path, work: Path, model: str, enhancement_mo
         if active_model == "espcn":
             enhanced = work / "status_photo_espcn.png"
             from espcn import upscale_image
-            upscale_image(normalized_source, enhanced, work / "espcn_x3.tflite")
+            upscale_image(
+                normalized_source, enhanced, work / "espcn_x3.tflite",
+                heartbeat=lambda: update_job(job["id"], stage="ai_enhancement"),
+                progress=ai_job_progress_callback(job["id"], base=10, span=40),
+            )
             generated_dimensions = (width * 3, height * 3)
         else:
             update_job(job["id"], stage="loading_ai_model", progress=10)
-            ensure_ai_model_runtime(active_model, work / "ai-runtime")
+            ensure_ai_model_runtime(active_model, work / "ai-runtime", heartbeat=lambda: update_job(
+                job["id"], stage="loading_ai_model",
+            ))
             update_job(job["id"], stage="ai_enhancement", progress=11)
             from ai_image_models import upscale_image
             enhanced = work / f"status_photo_{active_model}.png"
-            generated_dimensions = upscale_image(normalized_source, enhanced, active_model, work / "model-cache")
+            generated_dimensions = upscale_image(
+                normalized_source, enhanced, active_model, work / "model-cache",
+                heartbeat=lambda: update_job(job["id"], stage="ai_enhancement"),
+                progress=ai_job_progress_callback(job["id"]),
+            )
         with Image.open(enhanced) as processed:
             image = processed.convert("RGB")
         models_used.append(active_model)
@@ -1363,16 +1413,26 @@ def render(job, work: Path):
                 enhanced_path = work / f"clip_{i}_{active_ai_model}_enhanced.png"
                 if active_ai_model == "espcn":
                     from espcn import upscale_image
-                    upscale_image(path, enhanced_path, work / "espcn_x3.tflite")
+                    upscale_image(
+                        path, enhanced_path, work / "espcn_x3.tflite",
+                        heartbeat=lambda jid=job["id"]: update_job(jid, stage="ai_enhancement"),
+                        progress=ai_job_progress_callback(job["id"], base=10, span=40),
+                    )
                     ai_generated_dimensions = (source_width * 3, source_height * 3)
                 elif active_ai_model in AI_TEMPORAL_MODELS:
                     raise ValueError("ai_temporal_model_requires_video")
                 else:
                     update_job(job["id"], stage="loading_ai_model", progress=10)
-                    ensure_ai_model_runtime(active_ai_model, work / "ai-runtime")
+                    ensure_ai_model_runtime(active_ai_model, work / "ai-runtime", heartbeat=lambda: update_job(
+                        job["id"], stage="loading_ai_model",
+                    ))
                     update_job(job["id"], stage="ai_enhancement", progress=11)
                     from ai_image_models import upscale_image
-                    ai_generated_dimensions = upscale_image(path, enhanced_path, active_ai_model, work / "model-cache")
+                    ai_generated_dimensions = upscale_image(
+                        path, enhanced_path, active_ai_model, work / "model-cache",
+                        heartbeat=lambda jid=job["id"]: update_job(jid, stage="ai_enhancement"),
+                        progress=ai_job_progress_callback(job["id"]),
+                    )
             else:
                 try:
                     source_fps = float(Fraction(str(v.get("avg_frame_rate") or v.get("r_frame_rate") or "24/1")))
@@ -1385,14 +1445,15 @@ def render(job, work: Path):
                     upscale_video(
                         path, enhanced_path, source_width, source_height, source_fps, duration,
                         work / "espcn_x3.tflite",
-                        progress=lambda p, jid=job["id"]: update_job(
-                            jid, stage="ai_enhancement", progress=10 + int(40 * p / 100),
-                        ),
+                        progress=ai_percent_progress_callback(job["id"], divisor=10),
+                        heartbeat=lambda jid=job["id"]: update_job(jid, stage="ai_enhancement"),
                     )
                     ai_generated_dimensions = (source_width * 3, source_height * 3)
                 else:
                     update_job(job["id"], stage="loading_ai_model", progress=10)
-                    ensure_ai_model_runtime(active_ai_model, work / "ai-runtime")
+                    ensure_ai_model_runtime(active_ai_model, work / "ai-runtime", heartbeat=lambda: update_job(
+                        job["id"], stage="loading_ai_model",
+                    ))
                     update_job(job["id"], stage="ai_enhancement", progress=11)
                     if active_ai_model == "vrt":
                         from temporal_models import upscale_video
@@ -1400,6 +1461,10 @@ def render(job, work: Path):
                         ai_generated_dimensions = upscale_video(
                             path, enhanced_path, source_width, source_height, source_fps, duration,
                             work / "model-cache" / "vrt",
+                            progress=ai_job_progress_callback(job["id"]),
+                            heartbeat=lambda jid=job["id"]: update_job(
+                                jid, stage="ai_enhancement",
+                            ),
                         )
                     elif active_ai_model == "basicvsr":
                         from temporal_models import upscale_basicvsr_video
@@ -1407,6 +1472,10 @@ def render(job, work: Path):
                         ai_generated_dimensions = upscale_basicvsr_video(
                             path, enhanced_path, source_width, source_height, source_fps, duration,
                             work / "model-cache" / "basicvsr",
+                            progress=ai_job_progress_callback(job["id"]),
+                            heartbeat=lambda jid=job["id"]: update_job(
+                                jid, stage="ai_enhancement",
+                            ),
                         )
                     else:
                         from ai_image_models import upscale_video
@@ -1414,6 +1483,10 @@ def render(job, work: Path):
                         ai_generated_dimensions = upscale_video(
                             path, enhanced_path, active_ai_model, source_width, source_height, source_fps, duration,
                             work / "model-cache",
+                            progress=ai_job_progress_callback(job["id"]),
+                            heartbeat=lambda jid=job["id"]: update_job(
+                                jid, stage="ai_enhancement",
+                            ),
                         )
             path = enhanced_path
             meta = probe(path)

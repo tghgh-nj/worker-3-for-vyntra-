@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import time
 import urllib.request
 from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from ai_runtime import cpu_thread_count
 
 MODEL_URL = "https://storage.googleapis.com/ailia-models-tflite/espcn/espcn.tflite"
 MODEL_SHA256 = "e1607d2ce4f02b2f03b74fc5699cf709570e9d3d407dd9e69e9f16806bfd77d54"
@@ -31,16 +33,20 @@ def validate_espcn_source(width: int, height: int, fps: float, duration: float) 
         raise ValueError("espcn_clip_limit_180_seconds")
 
 
-def load_model(model_path: Path):
+def load_model(model_path: Path, heartbeat=None):
     """Download the Apache-2.0 source model and verify its pinned SHA-256."""
     if not model_path.exists():
         request = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Vyntra-StatusHD-Renderer/1.0"})
-        with urllib.request.urlopen(request, timeout=60) as response, model_path.open("wb") as out:
+        last_heartbeat = time.monotonic()
+        with urllib.request.urlopen(request, timeout=30) as response, model_path.open("wb") as out:
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
                 out.write(chunk)
+                if heartbeat and time.monotonic() - last_heartbeat >= 5:
+                    heartbeat()
+                    last_heartbeat = time.monotonic()
     digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     if digest != MODEL_SHA256:
         model_path.unlink(missing_ok=True)
@@ -49,7 +55,7 @@ def load_model(model_path: Path):
         from ai_edge_litert.interpreter import Interpreter
     except ImportError as exc:
         raise RuntimeError("espcn_runtime_unavailable") from exc
-    interpreter = Interpreter(model_path=str(model_path), num_threads=2)
+    interpreter = Interpreter(model_path=str(model_path), num_threads=cpu_thread_count())
     interpreter.allocate_tensors()
     input_detail = interpreter.get_input_details()[0]
     output_detail = interpreter.get_output_details()[0]
@@ -60,16 +66,19 @@ def load_model(model_path: Path):
     return interpreter, input_detail["index"], output_detail["index"]
 
 
-def upscale_image(source: Path, destination: Path, model_path: Path) -> None:
+def upscale_image(source: Path, destination: Path, model_path: Path, heartbeat=None, progress=None) -> None:
     """Enhance one still image with ESPCN and save the actual 3x image result."""
     image = Image.open(source).convert("RGB")
     width, height = image.size
     if width < 1 or height < 1 or max(width, height) > MAX_PHOTO_SOURCE_EDGE or min(width, height) > MAX_PHOTO_SOURCE_SHORT_EDGE:
         raise ValueError("espcn_source_must_be_480p_or_lower")
-    interpreter, input_index, output_index = load_model(model_path)
+    interpreter, input_index, output_index = load_model(model_path, heartbeat)
     try:
         frame = np.asarray(image, dtype=np.uint8)
         enlarged = np.empty((height * SCALE, width * SCALE, 3), dtype=np.uint8)
+        tile_count = max(1, ((height + TILE - 1) // TILE) * ((width + TILE - 1) // TILE))
+        completed_tiles = 0
+        last_heartbeat = time.monotonic()
         for top in range(0, height, TILE):
             tile_h = min(TILE, height - top)
             for left in range(0, width, TILE):
@@ -86,6 +95,11 @@ def upscale_image(source: Path, destination: Path, model_path: Path) -> None:
                 if tile_h != TILE or tile_w != TILE:
                     rgb = np.asarray(Image.fromarray(rgb).resize((tile_w*SCALE, tile_h*SCALE), Image.Resampling.BICUBIC))
                 enlarged[top*SCALE:(top+tile_h)*SCALE, left*SCALE:(left+tile_w)*SCALE] = rgb
+                completed_tiles += 1
+                if progress: progress(completed_tiles / tile_count)
+                if heartbeat and time.monotonic() - last_heartbeat >= 5:
+                    heartbeat()
+                    last_heartbeat = time.monotonic()
         Image.fromarray(enlarged, mode="RGB").save(destination, format="PNG")
     finally:
         interpreter = None
@@ -106,10 +120,10 @@ def _read_exact(stream, size: int) -> bytes:
 
 
 def upscale_video(source: Path, destination: Path, width: int, height: int,
-                  fps: float, duration: float, model_path: Path, progress=None) -> None:
+                  fps: float, duration: float, model_path: Path, progress=None, heartbeat=None) -> None:
     """Run ESPCN on every source frame, then retain source audio in an MP4."""
     validate_espcn_source(width, height, fps, duration)
-    interpreter, input_index, output_index = load_model(model_path)
+    interpreter, input_index, output_index = load_model(model_path, heartbeat)
     rate = Fraction(str(fps)).limit_denominator(1001)
     raw_size = width * height * 3
     decoder_cmd = [
@@ -131,6 +145,7 @@ def upscale_video(source: Path, destination: Path, width: int, height: int,
         encoder = subprocess.Popen(encoder_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         frame_index = 0
         expected_frames = max(1, int(duration * fps))
+        last_heartbeat = time.monotonic()
         while True:
             raw = _read_exact(decoder.stdout, raw_size)
             if not raw:
@@ -157,6 +172,9 @@ def upscale_video(source: Path, destination: Path, width: int, height: int,
             frame_index += 1
             if progress and (frame_index % 8 == 0 or frame_index == expected_frames):
                 progress(min(10, max(1, int(frame_index * 10 / expected_frames))))
+            if heartbeat and time.monotonic() - last_heartbeat >= 5:
+                heartbeat()
+                last_heartbeat = time.monotonic()
         decoder.stdout.close()
         decoder_code = decoder.wait(timeout=30)
         decoder_error = decoder.stderr.read().decode("utf-8", errors="replace")

@@ -14,6 +14,7 @@ os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "test-only-not-a-secret")
 
 import worker
+from ai_runtime import bounded_cpu_threads, select_torch_device
 
 
 def read_worker_source():
@@ -42,18 +43,59 @@ class ESPCNGuardTests(unittest.TestCase):
 
 
 class AiEnhancementRoutingTests(unittest.TestCase):
+    def test_ai_cpu_threads_follow_runner_affinity_quota_and_configured_cap(self):
+        self.assertEqual(bounded_cpu_threads(8, 4), 4)
+        self.assertEqual(bounded_cpu_threads(2, 8), 2)
+        self.assertEqual(bounded_cpu_threads(16, 12, 6), 6)
+        self.assertEqual(bounded_cpu_threads(None, None), max(1, min(16, os.cpu_count() or 1)))
+
+    def test_cuda_device_selection_uses_cpu_fallback_and_rejects_unavailable_force(self):
+        class FakeCuda:
+            @staticmethod
+            def is_available(): return False
+        class FakeTorch:
+            cuda = FakeCuda()
+            @staticmethod
+            def device(value): return value
+        with patch.dict(os.environ, {"VYNTRA_AI_DEVICE": "auto"}):
+            self.assertEqual(select_torch_device(FakeTorch), "cpu")
+        with patch.dict(os.environ, {"VYNTRA_AI_DEVICE": "cuda"}):
+            with self.assertRaisesRegex(RuntimeError, "ai_cuda_runtime_unavailable"):
+                select_torch_device(FakeTorch)
+
     def test_legacy_mmcv_build_uses_setuptools_with_pkg_resources(self):
         self.assertIn("setuptools<82", worker.AI_BUILD_CONSTRAINTS.read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(worker.subprocess, "run") as install:
-                worker.ensure_ai_model_runtime("basicvsr", Path(directory))
+            install_process = unittest.mock.Mock()
+            install_process.poll.side_effect = [None, 0]
+            install_process.returncode = 0
+            heartbeats = []
+            with patch.object(worker.subprocess, "Popen", return_value=install_process) as install, \
+                    patch.object(worker.time, "sleep") as sleep:
+                worker.ensure_ai_model_runtime("basicvsr", Path(directory), heartbeat=lambda: heartbeats.append(True))
             args = install.call_args.args[0]
             self.assertIn("--build-constraint", args)
             constraint_index = args.index("--build-constraint") + 1
             self.assertEqual(Path(args[constraint_index]), worker.AI_BUILD_CONSTRAINTS)
             runtime_path = args[args.index("--target") + 1]
+            install_process.poll.assert_called()
+            sleep.assert_called_once_with(10)
+            self.assertEqual(heartbeats, [True])
             if runtime_path in worker.sys.path:
                 worker.sys.path.remove(runtime_path)
+
+    def test_ai_progress_is_monotonic_and_throttled_to_integer_percentage(self):
+        updates = []
+        with patch.object(worker, "update_job", side_effect=lambda job_id, **values: updates.append(values)):
+            progress = worker.ai_job_progress_callback("job-ai")
+            progress(0.0)
+            progress(0.2)
+            progress(0.2)
+            progress(0.1)
+            progress(1.0)
+        values = [update["progress"] for update in updates]
+        self.assertEqual(values, [11, 18, 49])
+        self.assertEqual(values, sorted(values))
 
     def test_every_advertised_model_has_a_worker_route(self):
         self.assertEqual(

@@ -6,13 +6,16 @@ Temporal networks are deliberately not routed through this module.
 from __future__ import annotations
 
 import hashlib
-import os
 import subprocess
+import threading
+import time
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 from PIL import Image
+from ai_runtime import configure_torch, select_torch_device
 
 MAX_IMAGE_PIXELS = 8_000_000
 MAX_IMAGE_OUTPUT_PIXELS = 33_177_600
@@ -20,6 +23,32 @@ MAX_VIDEO_SOURCE_LONG_EDGE = 1920
 MAX_VIDEO_SOURCE_SHORT_EDGE = 1080
 TILE = 128
 OVERLAP = 16
+
+
+def _keep_heartbeat_alive(heartbeat: Callable[[], None] | None):
+    """Keep the job lease fresh during blocking model setup/download calls."""
+    class HeartbeatGuard:
+        def __enter__(self):
+            self.stop = threading.Event()
+            self.thread = None
+            if heartbeat:
+                def run():
+                    while not self.stop.wait(5):
+                        try:
+                            heartbeat()
+                        except Exception:
+                            # The render path remains authoritative; the next
+                            # checkpoint will retry the database heartbeat.
+                            pass
+                self.thread = threading.Thread(target=run, name="vyntra-ai-heartbeat", daemon=True)
+                self.thread.start()
+            return self
+
+        def __exit__(self, *_):
+            self.stop.set()
+            if self.thread:
+                self.thread.join(timeout=1)
+    return HeartbeatGuard()
 
 WEIGHTS = {
     # Official BasicSR EDSR-M x4 checkpoint (Google Drive file ID from BasicSR's
@@ -82,7 +111,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _download_weight(model_id: str, cache: Path) -> Path:
+def _download_weight(model_id: str, cache: Path, heartbeat: Callable[[], None] | None = None) -> Path:
     if model_id not in WEIGHTS:
         raise ValueError("image_model_not_available")
     spec = WEIGHTS[model_id]
@@ -101,19 +130,24 @@ def _download_weight(model_id: str, cache: Path) -> Path:
             import gdown
         except ImportError as exc:
             raise RuntimeError("edsr_downloader_unavailable") from exc
-        downloaded = gdown.download(id=spec["id"], output=str(temporary), quiet=True, fuzzy=True)
+        with _keep_heartbeat_alive(heartbeat):
+            downloaded = gdown.download(id=spec["id"], output=str(temporary), quiet=True, fuzzy=True)
         if not downloaded or not temporary.is_file():
             temporary.unlink(missing_ok=True)
             raise RuntimeError("edsr_weight_download_failed")
     else:
         request = urllib.request.Request(spec["url"], headers={"User-Agent": "Vyntra-StatusHD-Renderer/1.0"})
         try:
-            with urllib.request.urlopen(request, timeout=180) as response, temporary.open("wb") as output:
+            last_heartbeat = time.monotonic()
+            with urllib.request.urlopen(request, timeout=30) as response, temporary.open("wb") as output:
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
                     output.write(chunk)
+                    if heartbeat and time.monotonic() - last_heartbeat >= 5:
+                        heartbeat()
+                        last_heartbeat = time.monotonic()
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
@@ -127,24 +161,31 @@ def _download_weight(model_id: str, cache: Path) -> Path:
     return path
 
 
-def _load_model(model_id: str, cache: Path):
+def _load_model(model_id: str, cache: Path, heartbeat: Callable[[], None] | None = None):
     try:
         import torch
         from spandrel import ModelLoader
         import spandrel_extra_arches  # noqa: F401 - registers additional architectures
     except ImportError as exc:
         raise RuntimeError("ai_image_runtime_unavailable") from exc
-    weight_path = _download_weight(model_id, cache)
-    descriptor = ModelLoader().load_from_file(weight_path)
+    weight_path = _download_weight(model_id, cache, heartbeat)
+    with _keep_heartbeat_alive(heartbeat):
+        descriptor = ModelLoader().load_from_file(weight_path)
     scale = int(descriptor.scale)
     if scale not in (2, 3, 4, 8):
         raise RuntimeError("ai_model_unsupported_scale")
-    model = descriptor.model.to("cpu").eval()
-    torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
-    return torch, model, scale
+    configure_torch(torch)
+    device = select_torch_device(torch)
+    model = descriptor.model.to(device).eval()
+    if heartbeat:
+        heartbeat()
+    return torch, model, scale, device
 
 
-def _infer_image(torch, model, source: Image.Image, scale: int) -> Image.Image:
+def _infer_image(torch, model, source: Image.Image, scale: int,
+                 heartbeat: Callable[[], None] | None = None,
+                 progress: Callable[[float], None] | None = None,
+                 device=None) -> Image.Image:
     if source.width * source.height > MAX_IMAGE_PIXELS:
         raise ValueError("ai_image_pixel_limit")
     if source.width * source.height * scale * scale > MAX_IMAGE_OUTPUT_PIXELS:
@@ -152,12 +193,18 @@ def _infer_image(torch, model, source: Image.Image, scale: int) -> Image.Image:
     rgb = np.asarray(source.convert("RGB"), dtype=np.float32) / 255.0
     height, width = rgb.shape[:2]
     result = np.empty((height * scale, width * scale, 3), dtype=np.uint8)
+    last_heartbeat = time.monotonic()
+    tiles_x = (width + TILE - 1) // TILE
+    tiles_y = (height + TILE - 1) // TILE
+    completed_tiles = 0
     with torch.inference_mode():
         for core_y in range(0, height, TILE):
             for core_x in range(0, width, TILE):
                 y0, x0 = max(0, core_y - OVERLAP), max(0, core_x - OVERLAP)
                 y1, x1 = min(height, core_y + TILE + OVERLAP), min(width, core_x + TILE + OVERLAP)
                 tile = torch.from_numpy(rgb[y0:y1, x0:x1].copy()).permute(2, 0, 1).unsqueeze(0)
+                if device is not None:
+                    tile = tile.to(device)
                 output = model(tile).squeeze(0).clamp(0, 1).permute(1, 2, 0).cpu().numpy()
                 output = np.clip(output * 255.0 + 0.5, 0, 255).astype(np.uint8)
                 core_x0, core_y0 = (core_x - x0) * scale, (core_y - y0) * scale
@@ -165,16 +212,24 @@ def _infer_image(torch, model, source: Image.Image, scale: int) -> Image.Image:
                 core_y1 = core_y0 + min(TILE, height - core_y) * scale
                 result[core_y * scale:(core_y + min(TILE, height - core_y)) * scale,
                        core_x * scale:(core_x + min(TILE, width - core_x)) * scale] = output[core_y0:core_y1, core_x0:core_x1]
+                completed_tiles += 1
+                if progress:
+                    progress(completed_tiles / (tiles_x * tiles_y))
+                if heartbeat and time.monotonic() - last_heartbeat >= 5:
+                    heartbeat()
+                    last_heartbeat = time.monotonic()
     return Image.fromarray(result, mode="RGB")
 
 
-def upscale_image(source: Path, destination: Path, model_id: str, cache: Path) -> tuple[int, int]:
+def upscale_image(source: Path, destination: Path, model_id: str, cache: Path,
+                  heartbeat: Callable[[], None] | None = None,
+                  progress: Callable[[float], None] | None = None) -> tuple[int, int]:
     with Image.open(source) as opened:
         image = opened.convert("RGB")
     if image.width * image.height > MAX_IMAGE_PIXELS:
         raise ValueError("ai_image_pixel_limit")
-    torch, model, scale = _load_model(model_id, cache)
-    enhanced = _infer_image(torch, model, image, scale)
+    torch, model, scale, device = _load_model(model_id, cache, heartbeat)
+    enhanced = _infer_image(torch, model, image, scale, heartbeat, progress, device)
     enhanced.save(destination, format="PNG")
     return enhanced.size
 
@@ -194,13 +249,15 @@ def _read_exact(stream, size: int) -> bytes:
 
 
 def upscale_video(source: Path, destination: Path, model_id: str, width: int,
-                  height: int, fps: float, duration: float, cache: Path) -> tuple[int, int]:
+                  height: int, fps: float, duration: float, cache: Path,
+                  progress: Callable[[float], None] | None = None,
+                  heartbeat: Callable[[], None] | None = None) -> tuple[int, int]:
     """Enhance every decoded frame with an image model; preserve source audio."""
     if width < 1 or height < 1 or max(width, height) > MAX_VIDEO_SOURCE_LONG_EDGE or min(width, height) > MAX_VIDEO_SOURCE_SHORT_EDGE:
         raise ValueError("ai_video_source_must_be_1080p_or_lower")
     if fps <= 0 or fps > 60 or duration <= 0 or duration > 180:
         raise ValueError("ai_video_source_limit")
-    torch, model, scale = _load_model(model_id, cache)
+    torch, model, scale, device = _load_model(model_id, cache, heartbeat)
     output_width, output_height = width * scale, height * scale
     if output_width * output_height > 33_177_600:
         raise ValueError("ai_video_output_pixel_limit")
@@ -218,6 +275,10 @@ def upscale_video(source: Path, destination: Path, model_id: str, width: int,
         "-shortest", "-movflags", "+faststart", str(destination),
     ]
     decoder = encoder = None
+    processed_frames = 0
+    expected_frames = max(1, round(duration * fps))
+    last_progress_frame = 0
+    last_report = time.monotonic()
     try:
         decoder = subprocess.Popen(decoder_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         encoder = subprocess.Popen(encoder_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -226,11 +287,23 @@ def upscale_video(source: Path, destination: Path, model_id: str, width: int,
             if not raw:
                 break
             frame = Image.fromarray(np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3), mode="RGB")
-            enhanced = _infer_image(torch, model, frame, scale)
+            enhanced = _infer_image(torch, model, frame, scale, heartbeat, device=device)
             try:
                 encoder.stdin.write(np.asarray(enhanced, dtype=np.uint8).tobytes())
             except (BrokenPipeError, OSError) as exc:
                 raise RuntimeError("ai_video_encoder_failed") from exc
+            processed_frames += 1
+            now = time.monotonic()
+            if progress and (
+                processed_frames - last_progress_frame >= max(1, round(fps * 5))
+                or processed_frames >= expected_frames
+            ):
+                progress(min(1.0, processed_frames / expected_frames))
+                last_progress_frame = processed_frames
+                last_report = now
+            elif heartbeat and now - last_report >= 5:
+                heartbeat()
+                last_report = now
         encoder.stdin.close()
         encoder.stdin = None
         decoder_stdout, decoder_stderr = decoder.communicate(timeout=120)
@@ -239,6 +312,8 @@ def upscale_video(source: Path, destination: Path, model_id: str, width: int,
             raise RuntimeError("ai_video_decoder_failed:" + decoder_stderr.decode("utf-8", "replace")[-500:])
         if encoder.returncode != 0:
             raise RuntimeError("ai_video_encoder_failed:" + encoder_stderr.decode("utf-8", "replace")[-500:])
+        if progress:
+            progress(1.0)
     finally:
         for process in (decoder, encoder):
             if process and process.poll() is None:
