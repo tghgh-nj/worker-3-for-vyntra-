@@ -14,14 +14,17 @@ MODEL_URL = "https://storage.googleapis.com/ailia-models-tflite/espcn/espcn.tfli
 MODEL_SHA256 = "e1607d2ce4f02b2f03b74fc5699cf709570e9d3d407dd9e69e9f16806bfd77d54"
 TILE = 64
 SCALE = 3
-MAX_SOURCE_EDGE = 854
+MAX_PHOTO_SOURCE_EDGE = 854
+MAX_PHOTO_SOURCE_SHORT_EDGE = 480
+MAX_VIDEO_SOURCE_EDGE = 1920
+MAX_VIDEO_SOURCE_SHORT_EDGE = 1080
 MAX_CLIP_SECONDS = 180.0
 MAX_INPUT_FPS = 24.0
 
 
 def validate_espcn_source(width: int, height: int, fps: float, duration: float) -> None:
-    if width < 1 or height < 1 or max(width, height) > MAX_SOURCE_EDGE or min(width, height) > 480:
-        raise ValueError("espcn_source_must_be_480p_or_lower")
+    if width < 1 or height < 1 or max(width, height) > MAX_VIDEO_SOURCE_EDGE or min(width, height) > MAX_VIDEO_SOURCE_SHORT_EDGE:
+        raise ValueError("espcn_source_must_be_1080p_or_lower")
     if fps <= 0 or fps > MAX_INPUT_FPS:
         raise ValueError("espcn_frame_rate_limit_24fps")
     if duration <= 0 or duration > MAX_CLIP_SECONDS:
@@ -61,7 +64,7 @@ def upscale_image(source: Path, destination: Path, model_path: Path) -> None:
     """Enhance one still image with ESPCN and save the actual 3x image result."""
     image = Image.open(source).convert("RGB")
     width, height = image.size
-    if width < 1 or height < 1 or max(width, height) > MAX_SOURCE_EDGE or min(width, height) > 480:
+    if width < 1 or height < 1 or max(width, height) > MAX_PHOTO_SOURCE_EDGE or min(width, height) > MAX_PHOTO_SOURCE_SHORT_EDGE:
         raise ValueError("espcn_source_must_be_480p_or_lower")
     interpreter, input_index, output_index = load_model(model_path)
     try:

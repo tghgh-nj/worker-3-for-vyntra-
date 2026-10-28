@@ -23,11 +23,38 @@ MAX_OUTPUT_BYTES = max(OUTPUT_PART_BYTES, int(os.getenv("VYNTRA_MAX_OUTPUT_BYTES
 RELEASE_TTL_HOURS = min(168, max(1, int(os.getenv("VYNTRA_RELEASE_TTL_HOURS", "6"))))
 RELEASE_REPOSITORY = os.getenv("VYNTRA_RELEASE_REPOSITORY", "fasmora-continue/here")
 RELEASE_TOKEN = os.getenv("VYNTRA_RELEASE_TOKEN", "")
-SUPPORTED_AI_MODELS = ("espcn", "edsr", "swinir", "realesrgan", "basicvsr", "vrt")
+SUPPORTED_AI_MODELS = (
+    "espcn", "edsr", "swinir", "realesrgan", "omnisr", "omnisr2", "bsrgan", "hat", "realhat",
+    "basicvsr", "vrt",
+)
+AI_PHOTO_ONLY_MODELS = {"hat", "realhat"}
+AI_TEMPORAL_MODELS = {"basicvsr", "vrt"}
+AI_FRAME_MODEL_MAX_SOURCE = (1920, 1080)
+AI_TEMPORAL_MAX_SOURCE = (854, 480)
+AI_IMAGE_MAX_PIXELS = 8_000_000
+AI_OUTPUT_PIXEL_LIMIT = 33_177_600
+AI_MODEL_SCALES = {
+    "espcn": 3,
+    "omnisr2": 2,
+    "edsr": 4,
+    "swinir": 4,
+    "realesrgan": 4,
+    "omnisr": 4,
+    "bsrgan": 4,
+    "hat": 4,
+    "realhat": 4,
+    "basicvsr": 4,
+    "vrt": 4,
+}
 AI_REQUIREMENTS_BY_MODEL = {
     "edsr": "requirements-ai-image.txt",
     "swinir": "requirements-ai-image.txt",
     "realesrgan": "requirements-ai-image.txt",
+    "omnisr": "requirements-ai-image.txt",
+    "omnisr2": "requirements-ai-image.txt",
+    "bsrgan": "requirements-ai-image.txt",
+    "hat": "requirements-ai-image.txt",
+    "realhat": "requirements-ai-image.txt",
     "vrt": "requirements-vrt.txt",
     "basicvsr": "requirements-temporal.txt",
 }
@@ -143,13 +170,12 @@ COMPLETION_ERROR_CODES = {
     "output_manifest_invalid", "completion_unauthorized", "job_not_found",
     "job_already_completed", "job_not_rendering", "source_receipt_required",
     "release_repository_not_private", "release_not_found", "release_asset_verification_failed",
+    "output_media_type_mismatch",
     "release_validation_unavailable", "job_completion_record_failed", "job_completion_conflict",
 }
-
-
 COMPLETION_MANIFEST_FIELDS = {
     "job_id", "asset_id", "release_id", "bytes", "sha256", "provider",
-    "repository", "release_tag", "asset_name", "output_path",
+    "repository", "release_tag", "asset_name", "content_type", "output_path",
 }
 
 
@@ -667,7 +693,7 @@ def _release_request(path: str, method="GET", payload=None):
         raise RuntimeError(f"github_release_http_{exc.code}") from None
 
 
-def _release_upload(source: Path, upload_url: str, asset_name: str, heartbeat=None):
+def _release_upload(source: Path, upload_url: str, asset_name: str, content_type="video/mp4", heartbeat=None):
     parsed = urllib.parse.urlsplit(upload_url.split("{", 1)[0])
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query.append(("name", asset_name))
@@ -678,7 +704,7 @@ def _release_upload(source: Path, upload_url: str, asset_name: str, heartbeat=No
         connection.putheader("Authorization", "Bearer " + RELEASE_TOKEN)
         connection.putheader("Accept", "application/vnd.github+json")
         connection.putheader("X-GitHub-Api-Version", "2022-11-28")
-        connection.putheader("Content-Type", "video/mp4")
+        connection.putheader("Content-Type", content_type)
         connection.putheader("Content-Length", str(source.stat().st_size))
         connection.endheaders()
         last_heartbeat = time.monotonic()
@@ -709,7 +735,7 @@ def _sha256_file(source: Path) -> str:
 
 
 def upload_output_release(source: Path, job, metadata: dict, work: Path) -> tuple[str, dict]:
-    """Store one verified, retry-safe MP4 asset in the configured private release repo."""
+    """Store one verified, retry-safe MP4 or PNG asset in the private release repo."""
     total_bytes = source.stat().st_size
     if total_bytes <= 0:
         raise ValueError("empty_render_output")
@@ -717,6 +743,10 @@ def upload_output_release(source: Path, job, metadata: dict, work: Path) -> tupl
         raise ValueError("output_exceeds_free_storage_limit")
     if not RELEASE_TOKEN:
         raise RuntimeError("github_release_not_configured")
+    content_type = metadata.get("contentType", "video/mp4")
+    extension = {"video/mp4": "mp4", "image/png": "png"}.get(content_type)
+    if extension is None:
+        raise ValueError("unsupported_output_content_type")
 
     repository = _release_request("")
     if not isinstance(repository, dict) or repository.get("private") is not True:
@@ -738,7 +768,7 @@ def upload_output_release(source: Path, job, metadata: dict, work: Path) -> tupl
         raise RuntimeError("github_release_create_failed")
 
     digest = _sha256_file(source)
-    asset_name = f"vyntra-{job_id}-{digest[:16]}.mp4"
+    asset_name = f"vyntra-{job_id}-{digest[:16]}.{extension}"
     assets = _release_request(f"/releases/{release['id']}/assets") or []
     if not isinstance(assets, list):
         raise RuntimeError("github_release_assets_invalid")
@@ -752,6 +782,7 @@ def upload_output_release(source: Path, job, metadata: dict, work: Path) -> tupl
                 source,
                 release["upload_url"],
                 asset_name,
+                content_type=content_type,
                 heartbeat=lambda sent, total: update_job(
                     job_id, stage="uploading_release",
                     progress=96 + int(2 * sent / max(total, 1)),
@@ -767,7 +798,7 @@ def upload_output_release(source: Path, job, metadata: dict, work: Path) -> tupl
                 _release_request(f"/releases/{release['id']}", "DELETE")
                 _release_request(f"/git/refs/tags/{urllib.parse.quote(tag, safe='')}", "DELETE")
             raise
-    if not isinstance(asset, dict) or not isinstance(asset.get("id"), int) or asset.get("size") != total_bytes or asset.get("state") != "uploaded":
+    if not isinstance(asset, dict) or not isinstance(asset.get("id"), int) or asset.get("size") != total_bytes or asset.get("state") != "uploaded" or asset.get("content_type") != content_type:
         raise RuntimeError("github_release_asset_verification_failed")
 
     # A prior attempt may have uploaded a different output for this job. Keep the
@@ -784,6 +815,7 @@ def upload_output_release(source: Path, job, metadata: dict, work: Path) -> tupl
         "releaseTag": tag,
         "assetId": asset["id"],
         "assetName": asset_name,
+        "contentType": content_type,
         "bytes": total_bytes,
         "sha256": digest,
     }
@@ -1003,9 +1035,49 @@ def resolve_ai_selection(plan: dict, clips: list, resolution: str) -> tuple[str,
         supported_resolutions.add("4320p")
     if resolution not in supported_resolutions:
         raise ValueError("ai_resolution_unavailable")
-    if mode != "normal" and (len(clips) != 1 or clips[0].get("mediaType", "video") != "video"):
-        raise ValueError("ai_requires_single_video_clip")
+    if mode != "normal" and len(clips) != 1:
+        raise ValueError("ai_requires_single_clip")
+    if mode != "normal" and clips[0].get("mediaType", "video") == "image" and model in AI_TEMPORAL_MODELS:
+        raise ValueError("ai_temporal_model_requires_video")
+    if mode != "normal" and clips[0].get("mediaType", "video") == "video" and model in AI_PHOTO_ONLY_MODELS:
+        raise ValueError("ai_model_requires_photo")
     return mode, model
+
+
+def validate_ai_source_dimensions(model: str, width: int, height: int) -> None:
+    """Use a higher source ceiling for tiled frame models than temporal models."""
+    max_long, max_short = AI_TEMPORAL_MAX_SOURCE if model in AI_TEMPORAL_MODELS else AI_FRAME_MODEL_MAX_SOURCE
+    if width < 1 or height < 1 or max(width, height) > max_long or min(width, height) > max_short:
+        limit = "480p" if model in AI_TEMPORAL_MODELS else "1080p"
+        raise ValueError(f"{model}_source_must_be_{limit}_or_lower")
+    if width * height * AI_MODEL_SCALES[model] ** 2 > AI_OUTPUT_PIXEL_LIMIT:
+        raise ValueError("ai_video_output_pixel_limit")
+
+
+def validate_ai_photo_dimensions(model: str, width: int, height: int) -> None:
+    """Use still-image limits, independent of the video decoder limits."""
+    if width < 1 or height < 1:
+        raise ValueError("ai_image_dimensions_invalid")
+    if model in AI_TEMPORAL_MODELS:
+        raise ValueError("ai_temporal_model_requires_video")
+    if model == "espcn" and (max(width, height) > 854 or min(width, height) > 480):
+        raise ValueError("espcn_photo_source_must_be_480p_or_lower")
+    if model != "espcn" and width * height > AI_IMAGE_MAX_PIXELS:
+        raise ValueError("ai_image_pixel_limit")
+    if width * height * AI_MODEL_SCALES[model] ** 2 > AI_OUTPUT_PIXEL_LIMIT:
+        raise ValueError("ai_image_output_pixel_limit")
+
+
+def resolve_clip_ai_model(clip: dict, media_type: str) -> str:
+    """Validate an editor clip's model and its image/video compatibility."""
+    model = clip.get("aiUpscaleModel", "none")
+    if model not in ("none", *SUPPORTED_AI_MODELS):
+        raise ValueError("ai_model_unavailable")
+    if model in AI_PHOTO_ONLY_MODELS and media_type != "image":
+        raise ValueError("ai_model_requires_photo")
+    if model in AI_TEMPORAL_MODELS and media_type != "video":
+        raise ValueError("ai_temporal_model_requires_video")
+    return model
 
 
 def visual_effect_filters(effect: str, width: int, height: int) -> list[str]:
@@ -1034,6 +1106,122 @@ def visual_effect_filters(effect: str, width: int, height: int) -> list[str]:
     if effect not in filters:
         raise ValueError("unsupported_effect")
     return filters[effect]
+
+
+def render_still_image(job, source: Path, work: Path, model: str, enhancement_mode: str):
+    """Render a Status photo as PNG, preserving still-image delivery semantics."""
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+
+    plan = job["project_snapshot"]
+    clips = plan["clips"]
+    if len(clips) != 1 or clips[0].get("mediaType") != "image":
+        raise ValueError("still_image_export_requires_one_photo")
+    if plan.get("musicPath") or plan.get("imageOverlays"):
+        raise ValueError("still_image_export_has_unsupported_overlays")
+    clip = clips[0]
+    normalized_source = work / "status_photo_normalized.png"
+    with Image.open(source) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGB")
+        image.save(normalized_source, format="PNG")
+
+    width, height = image.size
+    clip_model = resolve_clip_ai_model(clip, "image")
+    active_model = clip_model if clip_model != "none" else model if enhancement_mode != "normal" else "none"
+    generated_dimensions = None
+    models_used = []
+    if active_model != "none":
+        validate_ai_photo_dimensions(active_model, width, height)
+        update_job(job["id"], stage="ai_enhancement", progress=10)
+        if active_model == "espcn":
+            enhanced = work / "status_photo_espcn.png"
+            from espcn import upscale_image
+            upscale_image(normalized_source, enhanced, work / "espcn_x3.tflite")
+            generated_dimensions = (width * 3, height * 3)
+        else:
+            update_job(job["id"], stage="loading_ai_model", progress=10)
+            ensure_ai_model_runtime(active_model, work / "ai-runtime")
+            update_job(job["id"], stage="ai_enhancement", progress=11)
+            from ai_image_models import upscale_image
+            enhanced = work / f"status_photo_{active_model}.png"
+            generated_dimensions = upscale_image(normalized_source, enhanced, active_model, work / "model-cache")
+        with Image.open(enhanced) as processed:
+            image = processed.convert("RGB")
+        models_used.append(active_model)
+
+    rotation = int(clip.get("rotation", 0)) % 360
+    if rotation not in (0, 90, 180, 270):
+        raise ValueError("unsupported_rotation")
+    if rotation:
+        image = image.rotate(-rotation, expand=True)
+
+    aspect = plan.get("aspectRatio", "Original")
+    ratios = {"9:16": 9/16, "16:9": 16/9, "1:1": 1.0, "4:5": 4/5, "3:4": 3/4, "4:3": 4/3, "21:9": 21/9}
+    if aspect != "Original" and aspect not in ratios:
+        raise ValueError("invalid_aspect_ratio")
+    target_ratio = image.width / image.height if aspect == "Original" else ratios[aspect]
+    if image.width / image.height > target_ratio:
+        crop_width = max(1, round(image.height * target_ratio))
+        left = (image.width - crop_width) // 2
+        image = image.crop((left, 0, left + crop_width, image.height))
+    elif image.width / image.height < target_ratio:
+        crop_height = max(1, round(image.width / target_ratio))
+        top = (image.height - crop_height) // 2
+        image = image.crop((0, top, image.width, top + crop_height))
+
+    output_width, output_height = output_dimensions(image.width, image.height, 0, aspect, job["resolution"])
+    if output_width * output_height > AI_OUTPUT_PIXEL_LIMIT:
+        raise ValueError("ai_image_output_pixel_limit")
+    image = image.resize((output_width, output_height), Image.Resampling.LANCZOS)
+    image = ImageEnhance.Brightness(image).enhance(1 + safe_number(clip.get("brightness", 0), -.25, .25, "brightness"))
+    image = ImageEnhance.Contrast(image).enhance(1 + safe_number(clip.get("contrast", 0), -.3, .3, "contrast"))
+    image = ImageEnhance.Color(image).enhance(1 + safe_number(clip.get("saturation", 0), -20, 30, "saturation") / 100)
+    sharpness = safe_number(clip.get("sharpness", 0), 0, .5, "sharpness")
+    if sharpness:
+        image = ImageEnhance.Sharpness(image).enhance(1 + sharpness * 2)
+
+    overlays = plan.get("overlays", [])
+    if not isinstance(overlays, list) or len(overlays) > 16:
+        raise ValueError("invalid_text_overlay")
+    if overlays:
+        image = image.convert("RGBA")
+        draw = ImageDraw.Draw(image)
+        for overlay in overlays:
+            text = str(overlay.get("text", ""))
+            start = safe_number(overlay.get("startMs", 0), 0, MAX_DURATION * 1000, "overlay_start")
+            end = safe_number(overlay.get("endMs", 1000), start + 1, MAX_DURATION * 1000, "overlay_end")
+            if not text or len(text) > 160 or not start <= 0 < end:
+                continue
+            font_size = int(safe_number(overlay.get("fontSize", 34), 16, 320, "font_size"))
+            x = safe_number(overlay.get("x", 0), -1, 1, "overlay_x")
+            y = safe_number(overlay.get("y", .55), -1, 1, "overlay_y")
+            argb = int(overlay.get("color", 0xFFFFFFFF))
+            color = (argb >> 16 & 255, argb >> 8 & 255, argb & 255)
+            alpha = (argb >> 24 & 255) if argb > 0xFFFFFF else 255
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+            except OSError:
+                font = ImageFont.load_default()
+            draw.text(
+                (output_width * (0.5 + x / 2), output_height * (0.5 + y / 2)), text,
+                anchor="mm", font=font, fill=(*color, alpha), stroke_width=max(2, round(font_size * .035)),
+                stroke_fill=(0, 0, 0, 210),
+            )
+        image = image.convert("RGB")
+
+    out = work / "render.png"
+    image.save(out, format="PNG", optimize=True)
+    with Image.open(out) as verified:
+        verified.verify()
+    update_job(job["id"], stage="verifying_output", progress=95)
+    metadata = {
+        "width": output_width, "height": output_height, "imageFormat": "png",
+        "contentType": "image/png", "bytes": out.stat().st_size,
+        "enhancementMode": "ai" if models_used and enhancement_mode == "normal" else enhancement_mode,
+        "aiModel": models_used[0] if models_used else None, "aiModels": models_used,
+        "aiGeneratedWidth": generated_dimensions[0] if generated_dimensions else None,
+        "aiGeneratedHeight": generated_dimensions[1] if generated_dimensions else None,
+    }
+    return out, metadata
 
 
 def render(job, work: Path):
@@ -1127,12 +1315,18 @@ def render(job, work: Path):
     source_complete_stage = "source_received" if source_manifest is not None else "sources_downloaded"
     update_job(job["id"], stage=source_complete_stage, progress=9)
 
+    if plan.get("outputMediaType") == "image/png":
+        if len(clips) != 1 or clips[0].get("mediaType") != "image":
+            raise ValueError("still_image_export_requires_one_photo")
+        return render_still_image(job, clip_sources[0], work, ai_model, enhancement_mode)
+
     local = []
     clip_lengths = []
     trim_ranges = []
     input_args = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-loglevel", "error"]
     probe_info = []
     ai_generated_dimensions = None
+    ai_models_used = []
     for i, clip in enumerate(clips):
         key = clip.get("path", "")
         if not key.startswith(job["owner_id"] + "/"):
@@ -1152,54 +1346,75 @@ def render(job, work: Path):
         start, end = clip_trim_range(clip, duration)
         if end <= start or end - start > MAX_DURATION: raise ValueError("invalid_trim_range")
         speed = safe_number(clip.get("speed", 1.0), .25, 4.0, "speed")
-        if enhancement_mode != "normal":
+        clip_ai_model = resolve_clip_ai_model(clip, media_type)
+        active_ai_model = clip_ai_model if clip_ai_model != "none" else ai_model
+        if enhancement_mode != "normal" or clip_ai_model != "none":
+            if active_ai_model not in ai_models_used:
+                ai_models_used.append(active_ai_model)
             update_job(job["id"], stage="ai_enhancement", progress=10)
-            if media_type != "video":
-                raise ValueError("cloud_ai_photo_export_not_supported")
-            try:
-                source_fps = float(Fraction(str(v.get("avg_frame_rate") or v.get("r_frame_rate") or "24/1")))
-            except (ValueError, ZeroDivisionError):
-                source_fps = 24.0
             source_width, source_height = int(v.get("width", 0)), int(v.get("height", 0))
+            if media_type == "image":
+                validate_ai_photo_dimensions(active_ai_model, source_width, source_height)
+            else:
+                validate_ai_source_dimensions(active_ai_model, source_width, source_height)
             if duration <= 0 or duration > MAX_DURATION:
                 raise ValueError("ai_clip_limit_180_seconds")
-            if ai_model == "espcn":
-                from espcn import validate_espcn_source, upscale_video
-                validate_espcn_source(source_width, source_height, source_fps, duration)
-                enhanced_path = work / f"clip_{i}_espcn.mp4"
-                upscale_video(
-                    path, enhanced_path, source_width, source_height, source_fps, duration,
-                    work / "espcn_x3.tflite",
-                    progress=lambda p, jid=job["id"]: update_job(
-                        jid, stage="ai_enhancement", progress=10 + int(40 * p / 100),
-                    ),
-                )
-                ai_generated_dimensions = (source_width * 3, source_height * 3)
-            else:
-                update_job(job["id"], stage="loading_ai_model", progress=10)
-                ensure_ai_model_runtime(ai_model, work / "ai-runtime")
-                update_job(job["id"], stage="ai_enhancement", progress=11)
-                if ai_model == "vrt":
-                    from temporal_models import upscale_video
-                    enhanced_path = work / "vrt_enhanced.mp4"
-                    ai_generated_dimensions = upscale_video(
-                        path, enhanced_path, source_width, source_height, source_fps, duration,
-                        work / "model-cache" / "vrt",
-                    )
-                elif ai_model == "basicvsr":
-                    from temporal_models import upscale_basicvsr_video
-                    enhanced_path = work / "basicvsr_enhanced.mp4"
-                    ai_generated_dimensions = upscale_basicvsr_video(
-                        path, enhanced_path, source_width, source_height, source_fps, duration,
-                        work / "model-cache" / "basicvsr",
-                    )
+            if media_type == "image":
+                enhanced_path = work / f"clip_{i}_{active_ai_model}_enhanced.png"
+                if active_ai_model == "espcn":
+                    from espcn import upscale_image
+                    upscale_image(path, enhanced_path, work / "espcn_x3.tflite")
+                    ai_generated_dimensions = (source_width * 3, source_height * 3)
+                elif active_ai_model in AI_TEMPORAL_MODELS:
+                    raise ValueError("ai_temporal_model_requires_video")
                 else:
-                    from ai_image_models import upscale_video
-                    enhanced_path = work / f"{ai_model}_enhanced.mp4"
-                    ai_generated_dimensions = upscale_video(
-                        path, enhanced_path, ai_model, source_width, source_height, source_fps, duration,
-                        work / "model-cache",
+                    update_job(job["id"], stage="loading_ai_model", progress=10)
+                    ensure_ai_model_runtime(active_ai_model, work / "ai-runtime")
+                    update_job(job["id"], stage="ai_enhancement", progress=11)
+                    from ai_image_models import upscale_image
+                    ai_generated_dimensions = upscale_image(path, enhanced_path, active_ai_model, work / "model-cache")
+            else:
+                try:
+                    source_fps = float(Fraction(str(v.get("avg_frame_rate") or v.get("r_frame_rate") or "24/1")))
+                except (ValueError, ZeroDivisionError):
+                    source_fps = 24.0
+                if active_ai_model == "espcn":
+                    from espcn import validate_espcn_source, upscale_video
+                    validate_espcn_source(source_width, source_height, source_fps, duration)
+                    enhanced_path = work / f"clip_{i}_espcn.mp4"
+                    upscale_video(
+                        path, enhanced_path, source_width, source_height, source_fps, duration,
+                        work / "espcn_x3.tflite",
+                        progress=lambda p, jid=job["id"]: update_job(
+                            jid, stage="ai_enhancement", progress=10 + int(40 * p / 100),
+                        ),
                     )
+                    ai_generated_dimensions = (source_width * 3, source_height * 3)
+                else:
+                    update_job(job["id"], stage="loading_ai_model", progress=10)
+                    ensure_ai_model_runtime(active_ai_model, work / "ai-runtime")
+                    update_job(job["id"], stage="ai_enhancement", progress=11)
+                    if active_ai_model == "vrt":
+                        from temporal_models import upscale_video
+                        enhanced_path = work / "vrt_enhanced.mp4"
+                        ai_generated_dimensions = upscale_video(
+                            path, enhanced_path, source_width, source_height, source_fps, duration,
+                            work / "model-cache" / "vrt",
+                        )
+                    elif active_ai_model == "basicvsr":
+                        from temporal_models import upscale_basicvsr_video
+                        enhanced_path = work / "basicvsr_enhanced.mp4"
+                        ai_generated_dimensions = upscale_basicvsr_video(
+                            path, enhanced_path, source_width, source_height, source_fps, duration,
+                            work / "model-cache" / "basicvsr",
+                        )
+                    else:
+                        from ai_image_models import upscale_video
+                        enhanced_path = work / f"{active_ai_model}_enhanced.mp4"
+                        ai_generated_dimensions = upscale_video(
+                            path, enhanced_path, active_ai_model, source_width, source_height, source_fps, duration,
+                            work / "model-cache",
+                        )
             path = enhanced_path
             meta = probe(path)
             v = next((s for s in meta.get("streams", []) if s.get("codec_type") == "video"), None)
@@ -1536,7 +1751,7 @@ def render(job, work: Path):
     expected_duration = sum(clip_lengths) - sum(duration for _, duration in active_transitions)
     if output_duration <= 0 or abs(output_duration - expected_duration) > max(1.0, len(clips) * 0.15):
         raise RuntimeError("output_verification_failed:duration")
-    return out, {"width": width, "height": height, "videoCodec": video.get("codec_name"), "durationSeconds": output_duration, "bytes": out.stat().st_size, "enhancementMode": enhancement_mode, "aiModel": ai_model if enhancement_mode != "normal" else None, "aiGeneratedWidth": ai_generated_dimensions[0] if ai_generated_dimensions else None, "aiGeneratedHeight": ai_generated_dimensions[1] if ai_generated_dimensions else None}
+    return out, {"width": width, "height": height, "videoCodec": video.get("codec_name"), "durationSeconds": output_duration, "bytes": out.stat().st_size, "enhancementMode": "ai" if ai_models_used and enhancement_mode == "normal" else enhancement_mode, "aiModel": ai_models_used[0] if ai_models_used else None, "aiModels": ai_models_used, "aiGeneratedWidth": ai_generated_dimensions[0] if ai_generated_dimensions else None, "aiGeneratedHeight": ai_generated_dimensions[1] if ai_generated_dimensions else None}
 
 def main():
     print("Vyntra worker ready", WORKER_ID, flush=True)

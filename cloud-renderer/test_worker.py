@@ -25,11 +25,12 @@ class ESPCNGuardTests(unittest.TestCase):
         from espcn import validate_espcn_source
         validate_espcn_source(854, 480, 24, 8.0)
         validate_espcn_source(480, 854, 24, 8.0)
+        validate_espcn_source(1920, 1080, 24, 8.0)
 
     def test_espcn_rejects_hd_sources_and_clips_over_three_minutes(self):
         from espcn import validate_espcn_source
-        with self.assertRaisesRegex(ValueError, "espcn_source_must_be_480p_or_lower"):
-            validate_espcn_source(1280, 720, 24, 5.0)
+        with self.assertRaisesRegex(ValueError, "espcn_source_must_be_1080p_or_lower"):
+            validate_espcn_source(3840, 2160, 24, 5.0)
         validate_espcn_source(640, 360, 24, 180.0)
         with self.assertRaisesRegex(ValueError, "espcn_clip_limit_180_seconds"):
             validate_espcn_source(640, 360, 24, 180.1)
@@ -57,18 +58,19 @@ class AiEnhancementRoutingTests(unittest.TestCase):
     def test_every_advertised_model_has_a_worker_route(self):
         self.assertEqual(
             set(worker.SUPPORTED_AI_MODELS),
-            {"espcn", "edsr", "swinir", "realesrgan", "basicvsr", "vrt"},
+            {"espcn", "edsr", "swinir", "realesrgan", "omnisr", "omnisr2", "bsrgan", "hat", "realhat", "basicvsr", "vrt"},
         )
         for model in worker.SUPPORTED_AI_MODELS:
             with self.subTest(model=model):
+                media_type = "image" if model in worker.AI_PHOTO_ONLY_MODELS else "video"
                 for mode in ("ai", "both"):
                     for resolution in ("720p", "1080p", "1440p", "2160p", "2880p", "3456p"):
                         selected_mode, selected = worker.resolve_ai_selection(
                             {"enhancementMode": mode, "aiModel": model},
-                            [{"mediaType": "video"}], resolution,
+                            [{"mediaType": media_type}], resolution,
                         )
                         self.assertEqual((selected_mode, selected), (mode, model))
-                if model != "espcn":
+                if model in worker.AI_REQUIREMENTS_BY_MODEL:
                     requirements = Path(worker.__file__).with_name(worker.AI_REQUIREMENTS_BY_MODEL[model])
                     self.assertTrue(requirements.is_file())
 
@@ -93,11 +95,35 @@ class AiEnhancementRoutingTests(unittest.TestCase):
                 {"enhancementMode": "ai", "aiModel": "swinir"},
                 [{"mediaType": "video"}], "999p",
             )
-        with self.assertRaisesRegex(ValueError, "ai_requires_single_video_clip"):
+        with self.assertRaisesRegex(ValueError, "ai_requires_single_clip"):
             worker.resolve_ai_selection(
                 {"enhancementMode": "both", "aiModel": "vrt"},
                 [{"mediaType": "video"}, {"mediaType": "video"}], "2160p",
             )
+
+    def test_still_image_ai_uses_frame_models_and_rejects_temporal_models(self):
+        worker.validate_ai_photo_dimensions("edsr", 1400, 1400)
+        worker.validate_ai_photo_dimensions("swinir", 1800, 1000)
+        worker.validate_ai_photo_dimensions("omnisr", 1800, 1000)
+        worker.validate_ai_photo_dimensions("omnisr2", 2500, 2000)
+        worker.validate_ai_photo_dimensions("bsrgan", 1800, 1000)
+        worker.validate_ai_photo_dimensions("hat", 1800, 1000)
+        worker.validate_ai_photo_dimensions("realhat", 1800, 1000)
+        worker.validate_ai_photo_dimensions("espcn", 854, 480)
+        with self.assertRaisesRegex(ValueError, "ai_temporal_model_requires_video"):
+            worker.validate_ai_photo_dimensions("basicvsr", 640, 360)
+        with self.assertRaisesRegex(ValueError, "ai_image_pixel_limit"):
+            worker.validate_ai_photo_dimensions("realesrgan", 4000, 3000)
+        with self.assertRaisesRegex(ValueError, "espcn_photo_source_must_be_480p_or_lower"):
+            worker.validate_ai_photo_dimensions("espcn", 1280, 720)
+
+    def test_clip_ai_models_match_media_kind(self):
+        self.assertEqual(worker.resolve_clip_ai_model({"aiUpscaleModel": "omnisr"}, "video"), "omnisr")
+        self.assertEqual(worker.resolve_clip_ai_model({"aiUpscaleModel": "realhat"}, "image"), "realhat")
+        with self.assertRaisesRegex(ValueError, "ai_model_requires_photo"):
+            worker.resolve_clip_ai_model({"aiUpscaleModel": "hat"}, "video")
+        with self.assertRaisesRegex(ValueError, "ai_temporal_model_requires_video"):
+            worker.resolve_clip_ai_model({"aiUpscaleModel": "vrt"}, "image")
 
 
 class JobProgressSchemaCompatibilityTests(unittest.TestCase):
@@ -144,28 +170,43 @@ class CompletionDiagnosticTests(unittest.TestCase):
     def test_completion_http_error_keeps_known_response_code(self):
         error = urllib.error.HTTPError(
             "https://supabase.example/functions/v1/vyntra-render-complete",
-            400, "Bad Request", {}, io.BytesIO(b'{"error":"output_manifest_invalid"}'),
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error":"output_manifest_invalid"}'),
         )
-        self.assertEqual(worker.safe_completion_http_error(error),
-                         "release_completion_http_400:output_manifest_invalid")
+        self.assertEqual(
+            worker.safe_completion_http_error(error),
+            "release_completion_http_400:output_manifest_invalid",
+        )
         error.close()
 
     def test_completion_http_error_keeps_safe_manifest_field_names(self):
         error = urllib.error.HTTPError(
             "https://supabase.example/functions/v1/vyntra-render-complete",
-            400, "Bad Request", {}, io.BytesIO(b'{"error":"output_manifest_invalid","fields":["repository","secret"]}'),
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error":"output_manifest_invalid","fields":["repository","secret"]}'),
         )
-        self.assertEqual(worker.safe_completion_http_error(error),
-                         "release_completion_http_400:output_manifest_invalid:repository")
+        self.assertEqual(
+            worker.safe_completion_http_error(error),
+            "release_completion_http_400:output_manifest_invalid:repository",
+        )
         error.close()
 
     def test_completion_http_error_does_not_log_unknown_response_text(self):
         error = urllib.error.HTTPError(
             "https://supabase.example/functions/v1/vyntra-render-complete",
-            400, "Bad Request", {}, io.BytesIO(b'{"error":"private token was invalid"}'),
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error":"private token was invalid"}'),
         )
-        self.assertEqual(worker.safe_completion_http_error(error),
-                         "release_completion_http_400:unrecognized_response")
+        self.assertEqual(
+            worker.safe_completion_http_error(error),
+            "release_completion_http_400:unrecognized_response",
+        )
         error.close()
 
 
@@ -221,7 +262,7 @@ class PrivateReleaseOutputTests(unittest.TestCase):
             source.write_bytes(b"verified mp4 bytes")
             with patch.object(worker, "RELEASE_TOKEN", "test-token"), \
                  patch.object(worker, "_release_request") as release_request, \
-                 patch.object(worker, "_release_upload", return_value={"id": 55, "size": source.stat().st_size, "state": "uploaded"}) as upload, \
+                 patch.object(worker, "_release_upload", return_value={"id": 55, "size": source.stat().st_size, "state": "uploaded", "content_type": "video/mp4"}) as upload, \
                  patch.object(worker, "update_job") as update, \
                  patch.object(worker, "api", return_value=[{"status": "finalizing"}]):
                 release_request.side_effect = [
@@ -239,6 +280,34 @@ class PrivateReleaseOutputTests(unittest.TestCase):
         self.assertEqual(metadata["bytes"], len(b"verified mp4 bytes"))
         self.assertEqual(metadata["sha256"], worker.hashlib.sha256(b"verified mp4 bytes").hexdigest())
         upload.assert_called_once()
+        update.assert_called_once()
+
+    def test_private_release_upload_preserves_png_photo_output(self):
+        job_id = "12345678-1234-5678-1234-567812345678"
+        job = {"id": job_id, "owner_id": "owner-123"}
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "render.png"
+            source.write_bytes(b"verified png bytes")
+            with patch.object(worker, "RELEASE_TOKEN", "test-token"), \
+                 patch.object(worker, "_release_request") as release_request, \
+                 patch.object(worker, "_release_upload", return_value={
+                     "id": 56, "size": source.stat().st_size, "state": "uploaded", "content_type": "image/png",
+                 }) as upload, \
+                 patch.object(worker, "update_job") as update, \
+                 patch.object(worker, "api", return_value=[{"status": "finalizing"}]):
+                release_request.side_effect = [
+                    {"private": True},
+                    {"id": 44, "upload_url": "https://uploads.github.com/repos/fasmora-continue/here/releases/44/assets{?name,label}"},
+                    [],
+                ]
+                output_path, metadata = worker.upload_output_release(
+                    source, job, {"contentType": "image/png", "imageFormat": "png"}, Path(directory),
+                )
+
+        self.assertEqual(output_path, "github-release:44:56")
+        self.assertEqual(metadata["contentType"], "image/png")
+        self.assertTrue(metadata["assetName"].endswith(".png"))
+        self.assertEqual(upload.call_args.kwargs["content_type"], "image/png")
         update.assert_called_once()
 
     def test_release_upload_refuses_a_public_or_missing_destination_repository(self):

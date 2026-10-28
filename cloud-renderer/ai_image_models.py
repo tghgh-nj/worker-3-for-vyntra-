@@ -15,6 +15,9 @@ import numpy as np
 from PIL import Image
 
 MAX_IMAGE_PIXELS = 8_000_000
+MAX_IMAGE_OUTPUT_PIXELS = 33_177_600
+MAX_VIDEO_SOURCE_LONG_EDGE = 1920
+MAX_VIDEO_SOURCE_SHORT_EDGE = 1080
 TILE = 128
 OVERLAP = 16
 
@@ -38,6 +41,35 @@ WEIGHTS = {
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
         "filename": "RealESRGAN_x4plus.pth",
         "sha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+    },
+    # OmniSR X4 is an Apache-2.0 lightweight transformer checkpoint. Safetensors
+    # avoids pickle-based model deserialization and the commit pins the asset.
+    "omnisr": {
+        "url": "https://huggingface.co/Acly/Omni-SR/resolve/b28a7caa0baba8669de3e49687e76e12448ea020/OmniSR_X4_DIV2K.safetensors",
+        "filename": "OmniSR_X4_DIV2K.safetensors",
+        "sha256": "dff25e4ed392cb5cbe534d920e292063a0555df9281c54c5ec321490a2a59832",
+    },
+    "omnisr2": {
+        "url": "https://huggingface.co/Acly/Omni-SR/resolve/b28a7caa0baba8669de3e49687e76e12448ea020/OmniSR_X2_DIV2K.safetensors",
+        "filename": "OmniSR_X2_DIV2K.safetensors",
+        "sha256": "79408fc23203bf161faa957c4a602cc40521ed2235a72d976bd9d375e6644611",
+    },
+    # BSRGAN is a practical blind-restoration model for real-world photos.
+    "bsrgan": {
+        "url": "https://huggingface.co/kadirnar/bsrgan/resolve/e80840d7348b9bc61b67a570d29e70eaa9293d32/BSRGAN.pth",
+        "filename": "BSRGAN.pth",
+        "sha256": "5d505a0766160921e0388d76e1ddf08cb114303990f9080432bf2b1c988b1c54",
+    },
+    # HAT offers clean-image and perceptual real-photo checkpoints.
+    "hat": {
+        "url": "https://huggingface.co/Acly/hat/resolve/8403819bcbf5959d54c72383f0725f2525472d30/HAT_SRx4_ImageNet-pretrain.pth",
+        "filename": "HAT_SRx4_ImageNet-pretrain.pth",
+        "sha256": "4ee053c42461187846dc0e93aa5abd34591c0725a8e044a59000e92ee215e833",
+    },
+    "realhat": {
+        "url": "https://huggingface.co/Acly/hat/resolve/8403819bcbf5959d54c72383f0725f2525472d30/Real_HAT_GAN_sharper.pth",
+        "filename": "Real_HAT_GAN_sharper.pth",
+        "sha256": "5800b67136006eb8cab3b4ed7c8d73b6a195bb18e6cc709b674f9aa069c00271",
     },
 }
 
@@ -115,6 +147,8 @@ def _load_model(model_id: str, cache: Path):
 def _infer_image(torch, model, source: Image.Image, scale: int) -> Image.Image:
     if source.width * source.height > MAX_IMAGE_PIXELS:
         raise ValueError("ai_image_pixel_limit")
+    if source.width * source.height * scale * scale > MAX_IMAGE_OUTPUT_PIXELS:
+        raise ValueError("ai_image_output_pixel_limit")
     rgb = np.asarray(source.convert("RGB"), dtype=np.float32) / 255.0
     height, width = rgb.shape[:2]
     result = np.empty((height * scale, width * scale, 3), dtype=np.uint8)
@@ -137,6 +171,8 @@ def _infer_image(torch, model, source: Image.Image, scale: int) -> Image.Image:
 def upscale_image(source: Path, destination: Path, model_id: str, cache: Path) -> tuple[int, int]:
     with Image.open(source) as opened:
         image = opened.convert("RGB")
+    if image.width * image.height > MAX_IMAGE_PIXELS:
+        raise ValueError("ai_image_pixel_limit")
     torch, model, scale = _load_model(model_id, cache)
     enhanced = _infer_image(torch, model, image, scale)
     enhanced.save(destination, format="PNG")
@@ -160,8 +196,8 @@ def _read_exact(stream, size: int) -> bytes:
 def upscale_video(source: Path, destination: Path, model_id: str, width: int,
                   height: int, fps: float, duration: float, cache: Path) -> tuple[int, int]:
     """Enhance every decoded frame with an image model; preserve source audio."""
-    if width < 1 or height < 1 or max(width, height) > 854 or min(width, height) > 480:
-        raise ValueError("ai_video_source_must_be_480p_or_lower")
+    if width < 1 or height < 1 or max(width, height) > MAX_VIDEO_SOURCE_LONG_EDGE or min(width, height) > MAX_VIDEO_SOURCE_SHORT_EDGE:
+        raise ValueError("ai_video_source_must_be_1080p_or_lower")
     if fps <= 0 or fps > 60 or duration <= 0 or duration > 180:
         raise ValueError("ai_video_source_limit")
     torch, model, scale = _load_model(model_id, cache)
