@@ -162,10 +162,18 @@ def update_job(job_id, **values):
         api(path, "PATCH", payload, {"Prefer": "return=minimal"})
 
 
+def check_job_cancelled(job_id):
+    path = "/rest/v1/vyntra_render_jobs?id=eq." + urllib.parse.quote(job_id) + "&select=status"
+    rows = api(path)
+    if rows and rows[0].get("status") == "cancel_requested":
+        raise InterruptedError("cancelled")
+
+
 def ai_job_progress_callback(job_id, base: int = 11, span: int = 38, stage: str = "ai_enhancement"):
     """Throttle tile/frame progress writes while preserving monotonic progress."""
     last_progress = [base - 1]
     last_update = [0.0]
+    last_cancel_check = [time.monotonic()]
 
     def report(value):
         fraction = max(0.0, min(1.0, float(value)))
@@ -175,6 +183,9 @@ def ai_job_progress_callback(job_id, base: int = 11, span: int = 38, stage: str 
             update_job(job_id, stage=stage, progress=progress)
             last_progress[0] = max(last_progress[0], progress)
             last_update[0] = now
+        if now - last_cancel_check[0] >= 5:
+            check_job_cancelled(job_id)
+            last_cancel_check[0] = now
 
     return report
 

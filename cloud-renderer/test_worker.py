@@ -97,6 +97,14 @@ class AiEnhancementRoutingTests(unittest.TestCase):
         self.assertEqual(values, [11, 18, 49])
         self.assertEqual(values, sorted(values))
 
+    def test_ai_progress_stops_when_job_is_cancel_requested(self):
+        with patch.object(worker, "update_job"), patch.object(worker, "check_job_cancelled", side_effect=InterruptedError("cancelled")):
+            progress = worker.ai_job_progress_callback("job-ai")
+            progress(0.5)
+            with patch.object(worker.time, "monotonic", return_value=worker.time.monotonic() + 6):
+                with self.assertRaisesRegex(InterruptedError, "cancelled"):
+                    progress(0.6)
+
     def test_every_advertised_model_has_a_worker_route(self):
         self.assertEqual(
             set(worker.SUPPORTED_AI_MODELS),

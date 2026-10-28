@@ -287,7 +287,13 @@ def upscale_video(source: Path, destination: Path, model_id: str, width: int,
             if not raw:
                 break
             frame = Image.fromarray(np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3), mode="RGB")
-            enhanced = _infer_image(torch, model, frame, scale, heartbeat, device=device)
+            def report_tile_progress(tile_fraction: float) -> None:
+                nonlocal last_report
+                now = time.monotonic()
+                if progress and (now - last_report >= 5 or processed_frames + tile_fraction >= expected_frames):
+                    progress(min(1.0, (processed_frames + tile_fraction) / expected_frames))
+                    last_report = now
+            enhanced = _infer_image(torch, model, frame, scale, heartbeat, report_tile_progress, device=device)
             try:
                 encoder.stdin.write(np.asarray(enhanced, dtype=np.uint8).tobytes())
             except (BrokenPipeError, OSError) as exc:
