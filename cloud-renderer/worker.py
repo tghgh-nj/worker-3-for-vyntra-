@@ -2,7 +2,7 @@
 """Vyntra cloud render worker. Runs outside Supabase Edge Functions."""
 from __future__ import annotations
 
-import hashlib, hmac, importlib, json, os, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request, uuid
+import hashlib, hmac, importlib, json, math, os, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request, uuid
 import http.client
 from pathlib import Path
 import re
@@ -25,10 +25,10 @@ RELEASE_REPOSITORY = os.getenv("VYNTRA_RELEASE_REPOSITORY", "fasmora-continue/he
 RELEASE_TOKEN = os.getenv("VYNTRA_RELEASE_TOKEN", "")
 SUPPORTED_AI_MODELS = (
     "espcn", "edsr", "swinir", "realesrgan", "realesrgan_x4v3", "omnisr", "omnisr2", "bsrgan", "hat", "realhat",
-    "safmn", "basicvsr", "vrt", "nanovsr", "edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr",
+    "safmn", "basicvsr", "vrt", "nanovsr", "mobile_rrn", "edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr",
 )
 AI_PHOTO_ONLY_MODELS = {"hat", "realhat"}
-AI_TEMPORAL_MODELS = {"basicvsr", "vrt", "nanovsr", "edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"}
+AI_TEMPORAL_MODELS = {"basicvsr", "vrt", "nanovsr", "mobile_rrn", "edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"}
 AI_FRAME_MODEL_MAX_SOURCE = (1920, 1080)
 AI_TEMPORAL_MAX_SOURCE = (1280, 720)
 AI_IMAGE_MAX_PIXELS = 8_000_000
@@ -48,6 +48,7 @@ AI_MODEL_SCALES = {
     "basicvsr": 4,
     "vrt": 4,
     "nanovsr": 4,
+    "mobile_rrn": 4,
     "edvr": 4,
     "tdan": 4,
     "basicvsr_v1": 4,
@@ -1002,7 +1003,7 @@ def probe(path: Path):
 def safe_number(value, low, high, name):
     try: number = float(value)
     except (TypeError, ValueError): raise ValueError("invalid_" + name)
-    if number < low or number > high: raise ValueError("invalid_" + name)
+    if not math.isfinite(number) or number < low or number > high: raise ValueError("invalid_" + name)
     return number
 
 def clip_speed_segments(clip, source_ms):
@@ -1052,6 +1053,40 @@ def atempo_chain(speed):
     filters.append(f"atempo={speed:.6f}")
     return filters
 
+
+def ffmpeg_picture_adjustment_filters(clip):
+    """Build validated FFmpeg adjustments shared by the cloud project pipeline."""
+    exposure = safe_number(clip.get("exposure", 0), -3, 3, "exposure")
+    temperature_offset = safe_number(clip.get("temperature", 0), -2500, 2500, "temperature")
+    tint = safe_number(clip.get("tint", 0), -1, 1, "tint")
+    denoise = safe_number(clip.get("noiseReduction", 0), 0, 1, "noise_reduction")
+    deblock = safe_number(clip.get("deblock", 0), 0, 1, "deblock")
+    stabilization = safe_number(clip.get("stabilization", 0), 0, 1, "stabilization")
+    filters = []
+    # Run motion analysis and cleanup before scaling to keep processing cost lower.
+    if stabilization > 0:
+        radius = max(8, round(16 + 48 * stabilization))
+        filters.append(f"deshake=rx={radius}:ry={radius}:edge=mirror:search=less")
+    if deblock > 0:
+        threshold = 0.098 + 0.05 * deblock
+        near = 0.05 + 0.03 * deblock
+        filters.append(f"deblock=filter=strong:block=8:alpha={threshold:.4f}:beta={near:.4f}:gamma={near:.4f}:delta={near:.4f}")
+    if denoise > 0:
+        # Moderate spatial and temporal strengths reduce noise without turning detail to wax.
+        luma = 1.5 + denoise * 4.5
+        chroma = 1.0 + denoise * 2.5
+        temporal_luma = 2.0 + denoise * 4.0
+        temporal_chroma = 1.5 + denoise * 2.5
+        filters.append(f"hqdn3d={luma:.3f}:{chroma:.3f}:{temporal_luma:.3f}:{temporal_chroma:.3f}")
+    if exposure:
+        filters.append(f"exposure=exposure={exposure:.4f}")
+    if temperature_offset:
+        temperature = round(max(1000, min(40000, 6500 + temperature_offset)))
+        filters.append(f"colortemperature=temperature={temperature}")
+    if tint:
+        filters.append(f"colorbalance=gm={tint:.4f}:pl=1")
+    return filters
+
 def clip_trim_range(clip, duration_seconds):
     # The editor saves duration from the platform player, while FFprobe reads
     # the decoded container duration. Treat FFprobe as authoritative and clamp
@@ -1096,7 +1131,7 @@ def ensure_ai_model_runtime(
     """Install heavyweight CPU inference packages only for jobs that need them."""
     requirement_name = AI_REQUIREMENTS_BY_MODEL.get(ai_model)
     if requirement_name is None:
-        if ai_model != "espcn":
+        if ai_model not in {"espcn", "mobile_rrn"}:
             raise ValueError("ai_model_unavailable")
         return
     requirements = Path(__file__).with_name(requirement_name)
@@ -1544,6 +1579,8 @@ def render(job, work: Path):
                 # unsupported jobs before installing a runtime or downloading weights.
                 if active_ai_model == "nanovsr" and source_fps > 30:
                     raise ValueError("nanovsr_video_limit_3_minutes_30_fps")
+                if active_ai_model == "mobile_rrn" and source_fps > 30:
+                    raise ValueError("mobile_rrn_video_limit_30_fps")
                 if active_ai_model == "espcn":
                     from espcn import validate_espcn_source, upscale_video
                     validate_espcn_source(source_width, source_height, source_fps, duration)
@@ -1594,6 +1631,15 @@ def render(job, work: Path):
                             heartbeat=lambda jid=job["id"]: update_job(
                                 jid, stage="ai_enhancement",
                             ),
+                        )
+                    elif active_ai_model == "mobile_rrn":
+                        from mobile_rrn import upscale_video as upscale_mobile_rrn_video
+                        enhanced_path = work / "mobile_rrn_enhanced.mp4"
+                        ai_generated_dimensions = upscale_mobile_rrn_video(
+                            path, enhanced_path, source_width, source_height, source_fps, duration,
+                            work / "model-cache" / "mobile_rrn",
+                            progress=ai_fraction_frame_progress_callback(job["id"], round(source_fps * duration), unit="Mobile RRN frame"),
+                            heartbeat=lambda jid=job["id"]: update_job(jid, stage="ai_enhancement"),
                         )
                     elif active_ai_model in {"edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"}:
                         from temporal_models import upscale_mmagic_video
@@ -1659,6 +1705,7 @@ def render(job, work: Path):
         if reverse: vf.append("reverse")
         frame_rate = int(safe_number(plan.get("exportFrameRate", 30), 24, 60, "frame_rate"))
         if frame_rate not in (24, 25, 30, 50, 60): raise ValueError("unsupported_frame_rate")
+        vf += ffmpeg_picture_adjustment_filters(clip)
         vf += [f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos", f"crop={width}:{height}", "setsar=1", f"fps={frame_rate}"]
         vf += effect_vf
         speed_segments = clip_speed_segments(clip, (trim_end-trim_start)*1000)

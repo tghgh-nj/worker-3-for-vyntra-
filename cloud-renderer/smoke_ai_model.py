@@ -57,6 +57,9 @@ def main() -> None:
                     expected = upscale_video(source, output, 64, 64, 24.0, 0.25, root / "model-cache" / "vrt")
                 elif model == "basicvsr":
                     expected = upscale_basicvsr_video(source, output, 64, 64, 24.0, 0.25, root / "model-cache" / "basicvsr")
+                elif model == "mobile_rrn":
+                    from mobile_rrn import upscale_video as upscale_mobile_rrn_video
+                    expected = upscale_mobile_rrn_video(source, output, 64, 64, 24.0, 0.25, root / "model-cache" / "mobile_rrn")
                 elif model in {"edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"}:
                     expected = upscale_mmagic_video(model, source, output, 64, 64, 24.0, 0.25, root / "model-cache" / model)
                 else:

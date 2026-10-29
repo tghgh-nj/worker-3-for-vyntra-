@@ -60,6 +60,11 @@ jobs:
           set -Eeuo pipefail
           /tmp/vyntra-venv/bin/python -m unittest -v test_worker.py
 
+      - name: Smoke-test Mobile RRN model
+        shell: bash
+        working-directory: cloud-renderer
+        run: /tmp/vyntra-venv/bin/python smoke_ai_model.py mobile_rrn
+
       - name: Process one queued render
         if: github.event_name != 'push'
         env:

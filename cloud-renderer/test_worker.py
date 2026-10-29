@@ -108,7 +108,7 @@ class AiEnhancementRoutingTests(unittest.TestCase):
     def test_every_advertised_model_has_a_worker_route(self):
         self.assertEqual(
             set(worker.SUPPORTED_AI_MODELS),
-            {"espcn", "edsr", "swinir", "realesrgan", "realesrgan_x4v3", "omnisr", "omnisr2", "bsrgan", "safmn", "hat", "realhat", "basicvsr", "vrt", "nanovsr", "edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"},
+            {"espcn", "edsr", "swinir", "realesrgan", "realesrgan_x4v3", "omnisr", "omnisr2", "bsrgan", "safmn", "hat", "realhat", "basicvsr", "vrt", "nanovsr", "mobile_rrn", "edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"},
         )
         for model in worker.SUPPORTED_AI_MODELS:
             with self.subTest(model=model):
@@ -131,6 +131,14 @@ class AiEnhancementRoutingTests(unittest.TestCase):
             ),
             ("ai", "espcn"),
         )
+
+    def test_mobile_rrn_is_cloud_video_only_and_uses_shared_litert_runtime(self):
+        self.assertIn("mobile_rrn", worker.AI_TEMPORAL_MODELS)
+        self.assertNotIn("mobile_rrn", worker.AI_REQUIREMENTS_BY_MODEL)
+        worker.ensure_ai_model_runtime("mobile_rrn", Path(tempfile.gettempdir()) / "vyntra-test-no-install")
+        with self.assertRaisesRegex(ValueError, "ai_temporal_model_requires_video"):
+            worker.resolve_clip_ai_model({"aiUpscaleModel": "mobile_rrn"}, "image")
+        worker.validate_ai_source_dimensions("mobile_rrn", 1280, 720)
 
     def test_ai_processed_clip_is_appended_as_an_input_without_corrupting_loglevel(self):
         args = ["ffmpeg", "-loglevel", "error"]
@@ -536,6 +544,45 @@ class SourceStorageRoutingTests(unittest.TestCase):
 
 
 class CloudEditingFeatureTests(unittest.TestCase):
+    def test_picture_adjustments_build_bounded_ffmpeg_filters(self):
+        filters = worker.ffmpeg_picture_adjustment_filters({
+            "exposure": 1.25,
+            "temperature": -900,
+            "tint": 0.2,
+            "noiseReduction": 0.5,
+            "deblock": 0.4,
+            "stabilization": 0.25,
+        })
+        self.assertTrue(any(item.startswith("deshake=") for item in filters))
+        self.assertTrue(any(item.startswith("deblock=") for item in filters))
+        self.assertTrue(any(item.startswith("hqdn3d=") for item in filters))
+        self.assertIn("exposure=exposure=1.2500", filters)
+        self.assertIn("colortemperature=temperature=5600", filters)
+        self.assertIn("colorbalance=gm=0.2000:pl=1", filters)
+        self.assertEqual(worker.ffmpeg_picture_adjustment_filters({}), [])
+
+    def test_picture_adjustments_reject_non_finite_and_out_of_range_values(self):
+        for field, value in (("exposure", 4), ("temperature", 3000), ("tint", float("nan")), ("noiseReduction", -0.1), ("deblock", 1.1), ("stabilization", 2)):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                worker.ffmpeg_picture_adjustment_filters({field: value})
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is installed in the worker workflow")
+    def test_picture_adjustment_filter_chain_executes_in_worker_ffmpeg(self):
+        filters = worker.ffmpeg_picture_adjustment_filters({
+            "exposure": 0.25,
+            "temperature": 400,
+            "tint": -0.1,
+            "noiseReduction": 0.2,
+            "deblock": 0.2,
+            "stabilization": 0.1,
+        })
+        result = subprocess.run([
+            "ffmpeg", "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
+            "testsrc2=size=320x180:rate=24:duration=1", "-vf", ",".join(filters),
+            "-f", "null", "-",
+        ], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_speed_curve_maps_segments_and_duration(self):
         segments = worker.clip_speed_segments({
             "speed": 1,
