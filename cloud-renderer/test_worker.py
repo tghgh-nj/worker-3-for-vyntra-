@@ -136,9 +136,14 @@ class AiEnhancementRoutingTests(unittest.TestCase):
         self.assertIn("mobile_rrn", worker.AI_TEMPORAL_MODELS)
         self.assertNotIn("mobile_rrn", worker.AI_REQUIREMENTS_BY_MODEL)
         worker.ensure_ai_model_runtime("mobile_rrn", Path(tempfile.gettempdir()) / "vyntra-test-no-install")
+        from mobile_rrn import MODEL_INPUT, MODEL_OUTPUT
+        self.assertEqual(MODEL_INPUT, (180, 320))  # width, height; official tensor is NHWC [1, 320, 180, C]
+        self.assertEqual(MODEL_OUTPUT, (720, 1280))
         with self.assertRaisesRegex(ValueError, "ai_temporal_model_requires_video"):
             worker.resolve_clip_ai_model({"aiUpscaleModel": "mobile_rrn"}, "image")
-        worker.validate_ai_source_dimensions("mobile_rrn", 1280, 720)
+        worker.validate_ai_source_dimensions("mobile_rrn", 320, 180)
+        with self.assertRaisesRegex(ValueError, "mobile_rrn_source_must_be_320x180_or_lower"):
+            worker.validate_ai_source_dimensions("mobile_rrn", 321, 180)
 
     def test_ai_processed_clip_is_appended_as_an_input_without_corrupting_loglevel(self):
         args = ["ffmpeg", "-loglevel", "error"]

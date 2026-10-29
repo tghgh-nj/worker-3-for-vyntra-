@@ -1219,12 +1219,14 @@ def resolve_ai_selection(plan: dict, clips: list, resolution: str) -> tuple[str,
 
 def validate_ai_source_dimensions(model: str, width: int, height: int) -> None:
     """Use a higher source ceiling for tiled frame models than temporal models."""
-    if model == "nanovsr":
+    if model == "mobile_rrn":
+        max_long, max_short = (320, 180)
+    elif model == "nanovsr":
         max_long, max_short = (480, 270)
     else:
         max_long, max_short = AI_TEMPORAL_MAX_SOURCE if model in AI_TEMPORAL_MODELS else AI_FRAME_MODEL_MAX_SOURCE
     if width < 1 or height < 1 or max(width, height) > max_long or min(width, height) > max_short:
-        limit = "270p" if model == "nanovsr" else "720p" if model in AI_TEMPORAL_MODELS else "1080p"
+        limit = "320x180" if model == "mobile_rrn" else "270p" if model == "nanovsr" else "720p" if model in AI_TEMPORAL_MODELS else "1080p"
         raise ValueError(f"{model}_source_must_be_{limit}_or_lower")
     if width * height * AI_MODEL_SCALES[model] ** 2 > AI_OUTPUT_PIXEL_LIMIT:
         raise ValueError("ai_video_output_pixel_limit")

@@ -16,7 +16,12 @@ MODEL_URL = (
 )
 MODEL_MIN_BYTES = 100_000
 SCALE = 4
-MAX_SOURCE = (1280, 720)
+# MediaTek's official TFLite export signature is NHWC [1, 320, 180, C]:
+# 320 rows (height) by 180 columns (width). Keep this tuple in width, height
+# order everywhere else in the adapter.
+MODEL_INPUT = (180, 320)
+MAX_SOURCE = MODEL_INPUT
+MODEL_OUTPUT = (MODEL_INPUT[0] * SCALE, MODEL_INPUT[1] * SCALE)
 MAX_OUTPUT_PIXELS = 33_177_600
 
 
@@ -69,7 +74,7 @@ def _download_model(path: Path, heartbeat: Callable[[], None] | None = None) -> 
     return path
 
 
-def _load_interpreter(model_path: Path, width: int, height: int, threads: int, heartbeat=None):
+def _load_interpreter(model_path: Path, threads: int, heartbeat=None):
     try:
         from ai_edge_litert.interpreter import Interpreter, OpResolverType
     except ImportError as exc:
@@ -91,8 +96,10 @@ def _load_interpreter(model_path: Path, width: int, height: int, threads: int, h
         state = next((item for item in inputs if item["shape"][-1] == 16), None)
         if pair is None or state is None:
             raise RuntimeError("mobile_rrn_input_signature_invalid")
-        interpreter.resize_tensor_input(pair["index"], [1, height, width, 6], strict=False)
-        interpreter.resize_tensor_input(state["index"], [1, height, width, 16], strict=False)
+        expected_pair = [1, MODEL_INPUT[1], MODEL_INPUT[0], 6]
+        expected_state = [1, MODEL_INPUT[1], MODEL_INPUT[0], 16]
+        if list(pair["shape"]) != expected_pair or list(state["shape"]) != expected_state:
+            raise RuntimeError("mobile_rrn_input_shape_invalid")
         interpreter.allocate_tensors()
         inputs = interpreter.get_input_details()
         outputs = interpreter.get_output_details()
@@ -104,7 +111,7 @@ def _load_interpreter(model_path: Path, width: int, height: int, threads: int, h
             raise RuntimeError("mobile_rrn_tensor_signature_invalid")
         if any(item["dtype"] != np.float32 for item in (pair, state, image, hidden)):
             raise RuntimeError("mobile_rrn_tensor_dtype_invalid")
-        if list(image["shape"]) != [1, height * SCALE, width * SCALE, 3]:
+        if list(image["shape"]) != [1, MODEL_OUTPUT[1], MODEL_OUTPUT[0], 3]:
             raise RuntimeError("mobile_rrn_output_shape_invalid")
         return interpreter, pair["index"], state["index"], image["index"], hidden["index"]
     except Exception:
@@ -125,7 +132,7 @@ def upscale_video(
 ) -> tuple[int, int]:
     """Run recurrent inference frame by frame, keeping one model instance per job."""
     if width < 1 or height < 1 or max(width, height) > MAX_SOURCE[0] or min(width, height) > MAX_SOURCE[1]:
-        raise ValueError("mobile_rrn_source_must_be_720p_or_lower")
+        raise ValueError("mobile_rrn_source_must_be_320x180_or_lower")
     if fps <= 0 or duration <= 0 or duration > 180:
         raise ValueError("mobile_rrn_clip_limit_180_seconds")
     out_width, out_height = width * SCALE, height * SCALE
@@ -137,19 +144,36 @@ def upscale_video(
     except ImportError:
         cpu_thread_count = lambda: 2
     interpreter, pair_index, state_index, image_index, hidden_index = _load_interpreter(
-        cache / "mobile_rrn_16.tflite", width, height, cpu_thread_count(), heartbeat,
+        cache / "mobile_rrn_16.tflite", cpu_thread_count(), heartbeat,
     )
-    frame_bytes = width * height * 3
-    state = np.zeros((1, height, width, 16), dtype=np.float32)
+    model_width, model_height = MODEL_INPUT
+    source_aspect = width / height
+    model_aspect = model_width / model_height
+    if source_aspect >= model_aspect:
+        content_width = model_width
+        content_height = max(2, int(round(model_width / source_aspect)) // 2 * 2)
+    else:
+        content_height = model_height
+        content_width = max(2, int(round(model_height * source_aspect)) // 2 * 2)
+    pad_x = (model_width - content_width) // 2
+    pad_y = (model_height - content_height) // 2
+    crop_width = content_width * SCALE
+    crop_height = content_height * SCALE
+    crop_x = pad_x * SCALE
+    crop_y = pad_y * SCALE
+    frame_bytes = model_width * model_height * 3
+    state = np.zeros((1, model_height, model_width, 16), dtype=np.float32)
     decoder_cmd = [
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-noautorotate",
         "-i", str(source), "-map", "0:v:0", "-an", "-sn", "-dn", "-vsync", "0",
+        "-vf", f"scale={content_width}:{content_height}:flags=lanczos,pad={model_width}:{model_height}:{pad_x}:{pad_y}:color=black,setsar=1",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
     ]
     encoder_cmd = [
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{out_width}x{out_height}",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{MODEL_OUTPUT[0]}x{MODEL_OUTPUT[1]}",
         "-r", str(Fraction(str(fps)).limit_denominator(1001)), "-i", "pipe:0", "-i", str(source),
+        "-vf", f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},scale={out_width}:{out_height}:flags=lanczos",
         "-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast",
         "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
         "-shortest", "-movflags", "+faststart", str(destination),
@@ -166,7 +190,7 @@ def upscale_video(
             raw = _read_exact(decoder.stdout, frame_bytes)
             if not raw:
                 break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(model_height, model_width, 3)
             current = frame.astype(np.float32)
             if previous is None:
                 previous = current
