@@ -1065,7 +1065,8 @@ def ffmpeg_picture_adjustment_filters(clip):
     filters = []
     # Run motion analysis and cleanup before scaling to keep processing cost lower.
     if stabilization > 0:
-        radius = max(8, round(16 + 48 * stabilization))
+        # FFmpeg deshake accepts rx/ry only in multiples of 16.
+        radius = min(64, max(16, round((16 + 48 * stabilization) / 16) * 16))
         filters.append(f"deshake=rx={radius}:ry={radius}:edge=mirror:search=less")
     if deblock > 0:
         threshold = 0.098 + 0.05 * deblock

@@ -553,7 +553,9 @@ class CloudEditingFeatureTests(unittest.TestCase):
             "deblock": 0.4,
             "stabilization": 0.25,
         })
-        self.assertTrue(any(item.startswith("deshake=") for item in filters))
+        deshake = next(item for item in filters if item.startswith("deshake="))
+        radius = int(deshake.split("rx=", 1)[1].split(":", 1)[0])
+        self.assertEqual(radius % 16, 0)
         self.assertTrue(any(item.startswith("deblock=") for item in filters))
         self.assertTrue(any(item.startswith("hqdn3d=") for item in filters))
         self.assertIn("exposure=exposure=1.2500", filters)
