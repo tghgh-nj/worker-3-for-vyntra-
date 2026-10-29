@@ -71,11 +71,18 @@ def _download_model(path: Path, heartbeat: Callable[[], None] | None = None) -> 
 
 def _load_interpreter(model_path: Path, width: int, height: int, threads: int, heartbeat=None):
     try:
-        from ai_edge_litert.interpreter import Interpreter
+        from ai_edge_litert.interpreter import Interpreter, OpResolverType
     except ImportError as exc:
         raise RuntimeError("mobile_rrn_runtime_unavailable") from exc
     model_path = _download_model(model_path, heartbeat)
-    interpreter = Interpreter(model_path=str(model_path), num_threads=max(1, min(4, threads)))
+    # The official recurrent graph fails XNNPACK delegate preparation on the
+    # Linux worker with dynamic hidden-state tensor shapes. Use LiteRT's
+    # optimized builtin CPU kernels without default delegates for this model.
+    interpreter = Interpreter(
+        model_path=str(model_path),
+        num_threads=max(1, min(4, threads)),
+        experimental_op_resolver_type=OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+    )
     try:
         inputs = interpreter.get_input_details()
         if len(inputs) != 2:
