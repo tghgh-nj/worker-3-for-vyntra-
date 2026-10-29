@@ -108,7 +108,7 @@ class AiEnhancementRoutingTests(unittest.TestCase):
     def test_every_advertised_model_has_a_worker_route(self):
         self.assertEqual(
             set(worker.SUPPORTED_AI_MODELS),
-            {"espcn", "edsr", "swinir", "realesrgan", "realesrgan_x4v3", "omnisr", "omnisr2", "bsrgan", "safmn", "hat", "realhat", "basicvsr", "vrt"},
+            {"espcn", "edsr", "swinir", "realesrgan", "realesrgan_x4v3", "omnisr", "omnisr2", "bsrgan", "safmn", "hat", "realhat", "basicvsr", "vrt", "nanovsr", "edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"},
         )
         for model in worker.SUPPORTED_AI_MODELS:
             with self.subTest(model=model):

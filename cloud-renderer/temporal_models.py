@@ -140,13 +140,53 @@ def _read_exact(stream, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def _tiled_temporal_frames(
+    frames: list[np.ndarray],
+    infer_tile: Callable[[list[np.ndarray]], np.ndarray],
+    scale: int = 4,
+    tile_size: int = 256,
+    halo: int = 64,
+    alignment: int = 8,
+) -> list[bytes]:
+    """Run a temporal model on bounded spatial tiles and stitch the output.
+
+    Adjacent tiles include an input halo so convolution and motion-alignment
+    operations have surrounding pixels. The halo is cropped from each tile's
+    result before stitching. This bounds peak activation memory on CPU workers.
+    """
+    height, width = frames[0].shape[:2]
+    output = np.empty((len(frames), height * scale, width * scale, 3), dtype=np.uint8)
+    for core_y in range(0, height, tile_size):
+        core_y_end = min(height, core_y + tile_size)
+        y0 = max(0, core_y - halo)
+        y1 = min(height, core_y_end + halo)
+        if alignment > 1:
+            y0 = (y0 // alignment) * alignment
+            y1 = min(height, ((y1 + alignment - 1) // alignment) * alignment)
+        for core_x in range(0, width, tile_size):
+            core_x_end = min(width, core_x + tile_size)
+            x0 = max(0, core_x - halo)
+            x1 = min(width, core_x_end + halo)
+            if alignment > 1:
+                x0 = (x0 // alignment) * alignment
+                x1 = min(width, ((x1 + alignment - 1) // alignment) * alignment)
+            tile_frames = [frame[y0:y1, x0:x1, :] for frame in frames]
+            tile_result = infer_tile(tile_frames)
+            if tile_result.shape != (len(frames), (y1 - y0) * scale, (x1 - x0) * scale, 3):
+                raise RuntimeError("temporal_tile_output_shape_mismatch")
+            src_y0, src_y1 = (core_y - y0) * scale, (core_y_end - y0) * scale
+            src_x0, src_x1 = (core_x - x0) * scale, (core_x_end - x0) * scale
+            output[:, core_y * scale:core_y_end * scale, core_x * scale:core_x_end * scale, :] = tile_result[:, src_y0:src_y1, src_x0:src_x1, :]
+    return [np.ascontiguousarray(frame).tobytes() for frame in output]
+
+
 def upscale_video(source: Path, destination: Path, width: int, height: int,
                   fps: float, duration: float, cache: Path,
                   progress: Callable[[float], None] | None = None,
                   heartbeat: Callable[[], None] | None = None) -> tuple[int, int]:
     """Run VRT over all frames in six-frame windows, keeping overlap for context."""
-    if width < 1 or height < 1 or max(width, height) > 854 or min(width, height) > 480:
-        raise ValueError("vrt_source_must_be_480p_or_lower")
+    if width < 1 or height < 1 or max(width, height) > 1280 or min(width, height) > 720:
+        raise ValueError("vrt_source_must_be_720p_or_lower")
     if fps <= 0 or fps > 30 or duration <= 0 or duration > 180:
         raise ValueError("vrt_video_limit")
     with _Heartbeat(heartbeat):
@@ -170,20 +210,24 @@ def upscale_video(source: Path, destination: Path, width: int, height: int,
     emitted = 0
     frame_bytes = width * height * 3
 
-    def infer_window(window_frames: list[np.ndarray]) -> list[bytes]:
-        array = np.stack(window_frames, axis=0)
+    def infer_tile(tile_frames: list[np.ndarray]) -> np.ndarray:
+        tile_height, tile_width = tile_frames[0].shape[:2]
+        array = np.stack(tile_frames, axis=0)
         tensor = torch.from_numpy(array.copy()).permute(0, 3, 1, 2).float().div_(255.0).unsqueeze(0).to(device)
-        h_pad = (8 - height % 8) % 8
-        w_pad = (8 - width % 8) % 8
+        h_pad = (8 - tile_height % 8) % 8
+        w_pad = (8 - tile_width % 8) % 8
         if h_pad:
             tensor = torch.cat([tensor, torch.flip(tensor[:, :, :, -h_pad:, :], [3])], dim=3)
         if w_pad:
             tensor = torch.cat([tensor, torch.flip(tensor[:, :, :, :, -w_pad:], [4])], dim=4)
         with _Heartbeat(heartbeat):
             with torch.inference_mode():
-                result = model(tensor).detach().cpu()[0, :, :, :height*SCALE, :width*SCALE]
+                result = model(tensor).detach().cpu()[0, :, :, :tile_height*SCALE, :tile_width*SCALE]
         result = result.permute(0, 2, 3, 1).clamp(0, 1).numpy()
-        return [np.clip(frame * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes() for frame in result]
+        return np.clip(result * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    def infer_window(window_frames: list[np.ndarray]) -> list[bytes]:
+        return _tiled_temporal_frames(window_frames, infer_tile, SCALE, alignment=8)
 
     try:
         decoder = subprocess.Popen(decoder_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -250,6 +294,281 @@ MMAGIC_SOURCE_COMMIT = "0a560bba9b79ebe78574e1d4cbbdd0e798e63568"
 MMAGIC_SOURCE_URL = f"https://github.com/open-mmlab/mmagic/archive/{MMAGIC_SOURCE_COMMIT}.zip"
 BASICVSR_WEIGHT_URL = "https://download.openmmlab.com/mmediting/restorers/basicvsr_plusplus/basicvsr_plusplus_c64n7_8x1_600k_reds4_20210217-db622b2f.pth"
 
+NANOVSR_WEIGHT_URL = "https://github.com/filippawlicki/nanovsr/releases/download/v1.0/nanovsr_226k.pth"
+NANOVSR_SOURCE_LIMIT = (480, 270)
+NANOVSR_MAX_DURATION_SECONDS = 180
+NANOVSR_WINDOW = 15
+NANOVSR_SCALE = 4
+MMAGIC_TEMPORAL_MODELS = {"edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"}
+MMAGIC_WINDOWED_MODELS = {"edvr", "tdan"}
+
+
+def _load_nanovsr(cache: Path, heartbeat: Callable[[], None] | None = None):
+    """Load the official lightweight NanoVSR checkpoint for CPU or CUDA."""
+    try:
+        import torch
+        from nanovsr_model import NanoVSR
+    except Exception as exc:
+        raise RuntimeError("nanovsr_runtime_unavailable") from exc
+    configure_torch(torch)
+    device = select_torch_device(torch)
+    checkpoint = _download(NANOVSR_WEIGHT_URL, cache / "nanovsr_226k.pth", 100_000, heartbeat)
+    try:
+        weights = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    except TypeError:
+        weights = torch.load(checkpoint, map_location="cpu")
+    if isinstance(weights, dict):
+        weights = next((weights[key] for key in ("params_ema", "params", "model_state_dict") if key in weights), weights)
+    if not isinstance(weights, dict) or not weights:
+        raise RuntimeError("nanovsr_checkpoint_invalid")
+    model = NanoVSR(num_feat=32, num_blocks=8)
+    result = model.load_state_dict(weights, strict=False)
+    if len(result.missing_keys) > 8 or len(result.unexpected_keys) > 8:
+        raise RuntimeError("nanovsr_checkpoint_incompatible")
+    model.switch_to_deploy()
+    model.eval().to(device)
+    return torch, model, device
+
+
+def upscale_nanovsr_video(
+    source: Path,
+    destination: Path,
+    width: int,
+    height: int,
+    fps: float,
+    duration: float,
+    cache: Path,
+    progress: Callable[[int, int], None] | None = None,
+    heartbeat: Callable[[], None] | None = None,
+) -> tuple[int, int]:
+    """Run NanoVSR in bounded 15-frame windows with measured frame progress."""
+    if width < 1 or height < 1 or max(width, height) > NANOVSR_SOURCE_LIMIT[0] or min(width, height) > NANOVSR_SOURCE_LIMIT[1]:
+        raise ValueError("nanovsr_source_must_be_270p_or_lower")
+    if fps <= 0 or fps > 30 or duration <= 0 or duration > NANOVSR_MAX_DURATION_SECONDS:
+        raise ValueError("nanovsr_video_limit_3_minutes_30_fps")
+    total_frames = max(1, round(fps * duration))
+    out_width, out_height = width * NANOVSR_SCALE, height * NANOVSR_SCALE
+    with _Heartbeat(heartbeat):
+        torch, model, device = _load_nanovsr(cache, heartbeat)
+
+    decoder_cmd = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-noautorotate",
+        "-i", str(source), "-map", "0:v:0", "-an", "-sn", "-dn",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+    ]
+    encoder_cmd = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{out_width}x{out_height}",
+        "-r", str(fps), "-i", "pipe:0", "-i", str(source),
+        "-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-movflags", "+faststart", str(destination),
+    ]
+    frame_bytes = width * height * 3
+    decoder = encoder = None
+    frame_count = 0
+    chunk: list[np.ndarray] = []
+
+    def infer_frames(frames: list[np.ndarray]) -> list[bytes]:
+        array = np.stack(frames, axis=0)
+        tensor = torch.from_numpy(array.copy()).permute(0, 3, 1, 2).unsqueeze(0).float().div_(255.0).to(device)
+        with _Heartbeat(heartbeat):
+            with torch.inference_mode():
+                result = model(tensor).detach().cpu()[0]
+        result = result.permute(0, 2, 3, 1).clamp(0, 1)
+        result = result.mul(255.0).round().to(torch.uint8).numpy()
+        return [np.ascontiguousarray(frame).tobytes() for frame in result]
+
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        decoder = subprocess.Popen(decoder_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        encoder = subprocess.Popen(encoder_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        while True:
+            raw = _read_exact(decoder.stdout, frame_bytes)
+            if not raw:
+                break
+            chunk.append(np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy())
+            if len(chunk) < NANOVSR_WINDOW:
+                continue
+            for output_frame in infer_frames(chunk):
+                encoder.stdin.write(output_frame)
+                frame_count += 1
+                if progress:
+                    progress(frame_count, total_frames)
+            chunk.clear()
+
+        if chunk:
+            for output_frame in infer_frames(chunk):
+                encoder.stdin.write(output_frame)
+                frame_count += 1
+                if progress:
+                    progress(frame_count, total_frames)
+        if frame_count == 0:
+            raise RuntimeError("nanovsr_decoder_no_frames")
+        encoder.stdin.close()
+        encoder.stdin = None
+        _, decoder_stderr = decoder.communicate(timeout=120)
+        _, encoder_stderr = encoder.communicate(timeout=900)
+        if decoder.returncode != 0:
+            raise RuntimeError("nanovsr_decoder_failed:" + decoder_stderr.decode("utf-8", "replace")[-500:])
+        if encoder.returncode != 0:
+            raise RuntimeError("nanovsr_encoder_failed:" + encoder_stderr.decode("utf-8", "replace")[-500:])
+    finally:
+        for process in (decoder, encoder):
+            if process and process.poll() is None:
+                process.kill()
+                process.wait()
+    if progress:
+        progress(frame_count, total_frames)
+    return out_width, out_height
+
+
+def upscale_mmagic_video(
+    model_name: str,
+    source: Path,
+    destination: Path,
+    width: int,
+    height: int,
+    fps: float,
+    duration: float,
+    cache: Path,
+    progress: Callable[[int, int], None] | None = None,
+    heartbeat: Callable[[], None] | None = None,
+) -> tuple[int, int]:
+    """Run an official MMagic temporal VSR model in bounded spatial tiles.
+
+    EDVR/TDAN use their native five-frame sliding windows; recurrent models are
+    evaluated in bounded 12-frame chunks. Output counts are reported as each
+    temporal chunk is actually encoded.
+    """
+    if model_name not in MMAGIC_TEMPORAL_MODELS:
+        raise ValueError("mmagic_video_model_unavailable")
+    if width < 1 or height < 1 or max(width, height) > 1280 or min(width, height) > 720:
+        raise ValueError(f"{model_name}_source_must_be_720p_or_lower")
+    if fps <= 0 or fps > 30 or duration <= 0 or duration > 180:
+        raise ValueError(f"{model_name}_video_limit_3_minutes_30_fps")
+
+    try:
+        import torch
+        from mmagic.apis import MMagicInferencer
+        from mmagic.apis.inferencers.inference_functions import pad_sequence
+    except Exception as exc:
+        raise RuntimeError("mmagic_video_runtime_unavailable") from exc
+    configure_torch(torch)
+    device = select_torch_device(torch)
+    cache.mkdir(parents=True, exist_ok=True)
+    os.environ["MMENGINE_HOME"] = str(cache / "mmengine")
+    os.environ["TORCH_HOME"] = str(cache / "torch")
+    extra = {"window_size": 5} if model_name in MMAGIC_WINDOWED_MODELS else {"max_seq_len": 12}
+    mmagic_model_name = {
+        "basicvsr_v1": "basicvsr",
+        "realbasicvsr": "real_basicvsr",
+    }.get(model_name, model_name)
+    try:
+        with _Heartbeat(heartbeat):
+            editor = MMagicInferencer(model_name=mmagic_model_name, device=str(device), extra_parameters=extra)
+        runner = editor.inferencer
+        model = runner.model
+    except Exception as exc:
+        raise RuntimeError(f"{model_name}_runtime_unavailable:{type(exc).__name__}") from exc
+
+    scale = 4
+    out_width, out_height = width * scale, height * scale
+    total_frames = max(1, round(fps * duration))
+    frame_bytes = width * height * 3
+    decoder_cmd = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-noautorotate",
+        "-i", str(source), "-map", "0:v:0", "-an", "-sn", "-dn",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+    ]
+    encoder_cmd = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{out_width}x{out_height}",
+        "-r", str(fps), "-i", "pipe:0", "-i", str(source),
+        "-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-movflags", "+faststart", str(destination),
+    ]
+    decoder = encoder = None
+    chunk: list[np.ndarray] = []
+    frame_count = 0
+    frame_chunk_size = 5 if model_name in MMAGIC_WINDOWED_MODELS else 12
+    chunk_overlap = 0 if model_name in MMAGIC_WINDOWED_MODELS else 4
+
+    def infer_tile(tile_frames: list[np.ndarray]) -> np.ndarray:
+        tile_height, tile_width = tile_frames[0].shape[:2]
+        array = np.stack(tile_frames, axis=0)
+        tensor = torch.from_numpy(array.copy()).permute(0, 3, 1, 2).float().div_(255.0).unsqueeze(0)
+
+        with _Heartbeat(heartbeat):
+            with torch.inference_mode():
+                if model_name in MMAGIC_WINDOWED_MODELS:
+                    padded = pad_sequence(tensor, 5)
+                    predictions = []
+                    for index in range(tensor.size(1)):
+                        window = padded[:, index:index + 5].to(device)
+                        prediction = model(inputs=window, mode="tensor")
+                        if prediction.ndim == 5:
+                            prediction = prediction[:, prediction.shape[1] // 2]
+                        predictions.append(prediction.detach().cpu())
+                    result = torch.stack(predictions, dim=1)[0]
+                else:
+                    result = model(inputs=tensor.to(device), mode="tensor").detach().cpu()[0]
+        if result.ndim != 4 or result.shape[0] != len(tile_frames):
+            raise RuntimeError(f"{model_name}_output_shape_mismatch")
+        result = result.permute(0, 2, 3, 1).clamp(0, 1).numpy()
+        return np.clip(result * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    def infer_chunk(frames: list[np.ndarray]) -> list[bytes]:
+        return _tiled_temporal_frames(frames, infer_tile, scale, tile_size=192, halo=64, alignment=8)
+
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        decoder = subprocess.Popen(decoder_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        encoder = subprocess.Popen(encoder_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        while True:
+            raw = _read_exact(decoder.stdout, frame_bytes)
+            if not raw:
+                break
+            chunk.append(np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy())
+            if len(chunk) < frame_chunk_size:
+                continue
+            outputs = infer_chunk(chunk)
+            emit_start = 0 if frame_count == 0 or chunk_overlap == 0 else chunk_overlap
+            for output_frame in outputs[emit_start:]:
+                encoder.stdin.write(output_frame)
+                frame_count += 1
+                if progress:
+                    progress(frame_count, total_frames)
+            chunk = chunk[-chunk_overlap:] if chunk_overlap else []
+
+        if chunk:
+            outputs = infer_chunk(chunk)
+            emit_start = 0 if frame_count == 0 else min(chunk_overlap, len(outputs))
+            for output_frame in outputs[emit_start:]:
+                encoder.stdin.write(output_frame)
+                frame_count += 1
+                if progress:
+                    progress(frame_count, total_frames)
+        if frame_count == 0:
+            raise RuntimeError(f"{model_name}_decoder_no_frames")
+        encoder.stdin.close()
+        encoder.stdin = None
+        _, decoder_stderr = decoder.communicate(timeout=120)
+        _, encoder_stderr = encoder.communicate(timeout=900)
+        if decoder.returncode != 0:
+            raise RuntimeError(f"{model_name}_decoder_failed:" + decoder_stderr.decode("utf-8", "replace")[-500:])
+        if encoder.returncode != 0:
+            raise RuntimeError(f"{model_name}_encoder_failed:" + encoder_stderr.decode("utf-8", "replace")[-500:])
+    finally:
+        for process in (decoder, encoder):
+            if process and process.poll() is None:
+                process.kill()
+                process.wait()
+    if progress:
+        progress(frame_count, total_frames)
+    return out_width, out_height
+
 
 def _ensure_basicvsr(cache: Path, heartbeat: Callable[[], None] | None = None):
     """Load BasicVSR++ through the official MMagic implementation on CPU."""
@@ -303,8 +622,8 @@ def upscale_basicvsr_video(source: Path, destination: Path, width: int, height: 
                            progress: Callable[[float], None] | None = None,
                            heartbeat: Callable[[], None] | None = None) -> tuple[int, int]:
     """Run BasicVSR++ on overlapping frame sequences; do not process frames independently."""
-    if width < 1 or height < 1 or max(width, height) > 854 or min(width, height) > 480:
-        raise ValueError("basicvsr_source_must_be_480p_or_lower")
+    if width < 1 or height < 1 or max(width, height) > 1280 or min(width, height) > 720:
+        raise ValueError("basicvsr_source_must_be_720p_or_lower")
     if fps <= 0 or fps > 30 or duration <= 0 or duration > 180:
         raise ValueError("basicvsr_video_limit")
     with _Heartbeat(heartbeat):
@@ -330,22 +649,26 @@ def upscale_basicvsr_video(source: Path, destination: Path, width: int, height: 
     frames: list[np.ndarray] = []
     emitted = 0
 
-    def infer_window(window_frames: list[np.ndarray]) -> list[bytes]:
-        array = np.stack(window_frames, axis=0)
+    def infer_tile(tile_frames: list[np.ndarray]) -> np.ndarray:
+        tile_height, tile_width = tile_frames[0].shape[:2]
+        array = np.stack(tile_frames, axis=0)
         tensor = torch.from_numpy(array.copy()).permute(0, 3, 1, 2).float().div_(255.0).unsqueeze(0).to(device)
-        h_pad = (32 - height % 32) % 32
-        w_pad = (32 - width % 32) % 32
+        h_pad = (32 - tile_height % 32) % 32
+        w_pad = (32 - tile_width % 32) % 32
         if h_pad:
             tensor = torch.cat([tensor, torch.flip(tensor[:, :, :, -h_pad:, :], [3])], dim=3)
         if w_pad:
             tensor = torch.cat([tensor, torch.flip(tensor[:, :, :, :, -w_pad:], [4])], dim=4)
         with _Heartbeat(heartbeat):
             with torch.inference_mode():
-                result = model(inputs=tensor, mode="tensor").detach().cpu()[0, :, :, :height*scale, :width*scale]
+                result = model(inputs=tensor, mode="tensor").detach().cpu()[0, :, :, :tile_height*scale, :tile_width*scale]
         if result.ndim != 4 or result.shape[0] != chunk_size:
             raise RuntimeError("basicvsr_output_shape_mismatch")
         result = result.permute(0, 2, 3, 1).clamp(0, 1).numpy()
-        return [np.clip(frame * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes() for frame in result]
+        return np.clip(result * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    def infer_window(window_frames: list[np.ndarray]) -> list[bytes]:
+        return _tiled_temporal_frames(window_frames, infer_tile, scale, alignment=32)
 
     try:
         decoder = subprocess.Popen(decoder_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

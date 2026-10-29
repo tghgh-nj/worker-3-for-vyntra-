@@ -25,12 +25,12 @@ RELEASE_REPOSITORY = os.getenv("VYNTRA_RELEASE_REPOSITORY", "fasmora-continue/he
 RELEASE_TOKEN = os.getenv("VYNTRA_RELEASE_TOKEN", "")
 SUPPORTED_AI_MODELS = (
     "espcn", "edsr", "swinir", "realesrgan", "realesrgan_x4v3", "omnisr", "omnisr2", "bsrgan", "hat", "realhat",
-    "safmn", "basicvsr", "vrt",
+    "safmn", "basicvsr", "vrt", "nanovsr", "edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr",
 )
 AI_PHOTO_ONLY_MODELS = {"hat", "realhat"}
-AI_TEMPORAL_MODELS = {"basicvsr", "vrt"}
+AI_TEMPORAL_MODELS = {"basicvsr", "vrt", "nanovsr", "edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"}
 AI_FRAME_MODEL_MAX_SOURCE = (1920, 1080)
-AI_TEMPORAL_MAX_SOURCE = (854, 480)
+AI_TEMPORAL_MAX_SOURCE = (1280, 720)
 AI_IMAGE_MAX_PIXELS = 8_000_000
 AI_OUTPUT_PIXEL_LIMIT = 33_177_600
 AI_MODEL_SCALES = {
@@ -47,6 +47,12 @@ AI_MODEL_SCALES = {
     "safmn": 4,
     "basicvsr": 4,
     "vrt": 4,
+    "nanovsr": 4,
+    "edvr": 4,
+    "tdan": 4,
+    "basicvsr_v1": 4,
+    "iconvsr": 4,
+    "realbasicvsr": 4,
 }
 AI_REQUIREMENTS_BY_MODEL = {
     "edsr": "requirements-ai-image.txt",
@@ -61,6 +67,12 @@ AI_REQUIREMENTS_BY_MODEL = {
     "safmn": "requirements-ai-image.txt",
     "vrt": "requirements-vrt.txt",
     "basicvsr": "requirements-temporal.txt",
+    "nanovsr": "requirements-vrt.txt",
+    "edvr": "requirements-temporal.txt",
+    "tdan": "requirements-temporal.txt",
+    "basicvsr_v1": "requirements-temporal.txt",
+    "iconvsr": "requirements-temporal.txt",
+    "realbasicvsr": "requirements-temporal.txt",
 }
 AI_BUILD_CONSTRAINTS = Path(__file__).with_name("requirements-ai-build-constraints.txt")
 ONESHOT = os.getenv("VYNTRA_ONESHOT", "false").lower() == "true"
@@ -1171,9 +1183,12 @@ def resolve_ai_selection(plan: dict, clips: list, resolution: str) -> tuple[str,
 
 def validate_ai_source_dimensions(model: str, width: int, height: int) -> None:
     """Use a higher source ceiling for tiled frame models than temporal models."""
-    max_long, max_short = AI_TEMPORAL_MAX_SOURCE if model in AI_TEMPORAL_MODELS else AI_FRAME_MODEL_MAX_SOURCE
+    if model == "nanovsr":
+        max_long, max_short = (480, 270)
+    else:
+        max_long, max_short = AI_TEMPORAL_MAX_SOURCE if model in AI_TEMPORAL_MODELS else AI_FRAME_MODEL_MAX_SOURCE
     if width < 1 or height < 1 or max(width, height) > max_long or min(width, height) > max_short:
-        limit = "480p" if model in AI_TEMPORAL_MODELS else "1080p"
+        limit = "270p" if model == "nanovsr" else "720p" if model in AI_TEMPORAL_MODELS else "1080p"
         raise ValueError(f"{model}_source_must_be_{limit}_or_lower")
     if width * height * AI_MODEL_SCALES[model] ** 2 > AI_OUTPUT_PIXEL_LIMIT:
         raise ValueError("ai_video_output_pixel_limit")
@@ -1525,6 +1540,10 @@ def render(job, work: Path):
                     source_fps = float(Fraction(str(v.get("avg_frame_rate") or v.get("r_frame_rate") or "24/1")))
                 except (ValueError, ZeroDivisionError):
                     source_fps = 24.0
+                # NanoVSR is deliberately bounded for public CPU workers. Reject
+                # unsupported jobs before installing a runtime or downloading weights.
+                if active_ai_model == "nanovsr" and source_fps > 30:
+                    raise ValueError("nanovsr_video_limit_3_minutes_30_fps")
                 if active_ai_model == "espcn":
                     from espcn import validate_espcn_source, upscale_video
                     validate_espcn_source(source_width, source_height, source_fps, duration)
@@ -1564,6 +1583,29 @@ def render(job, work: Path):
                             heartbeat=lambda jid=job["id"]: update_job(
                                 jid, stage="ai_enhancement",
                             ),
+                        )
+                    elif active_ai_model == "nanovsr":
+                        from temporal_models import upscale_nanovsr_video
+                        enhanced_path = work / "nanovsr_enhanced.mp4"
+                        ai_generated_dimensions = upscale_nanovsr_video(
+                            path, enhanced_path, source_width, source_height, source_fps, duration,
+                            work / "model-cache" / "nanovsr",
+                            progress=ai_job_frame_progress_callback(job["id"], round(source_fps * duration), unit="NanoVSR frame"),
+                            heartbeat=lambda jid=job["id"]: update_job(
+                                jid, stage="ai_enhancement",
+                            ),
+                        )
+                    elif active_ai_model in {"edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"}:
+                        from temporal_models import upscale_mmagic_video
+                        enhanced_path = work / f"{active_ai_model}_enhanced.mp4"
+                        frame_progress = ai_job_frame_progress_callback(
+                            job["id"], unit=f"{active_ai_model.upper()} frame",
+                        )
+                        ai_generated_dimensions = upscale_mmagic_video(
+                            active_ai_model, path, enhanced_path, source_width, source_height, source_fps, duration,
+                            work / "model-cache" / active_ai_model,
+                            progress=frame_progress,
+                            heartbeat=lambda jid=job["id"]: update_job(jid, stage="ai_enhancement"),
                         )
                     else:
                         from ai_image_models import upscale_video

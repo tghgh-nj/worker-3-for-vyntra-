@@ -52,11 +52,15 @@ def main() -> None:
             ], check=True, timeout=30)
             worker.ensure_ai_model_runtime(model, root / "ai-runtime")
             if model in worker.AI_TEMPORAL_MODELS:
-                from temporal_models import upscale_basicvsr_video, upscale_video
+                from temporal_models import upscale_basicvsr_video, upscale_mmagic_video, upscale_nanovsr_video, upscale_video
                 if model == "vrt":
                     expected = upscale_video(source, output, 64, 64, 24.0, 0.25, root / "model-cache" / "vrt")
-                else:
+                elif model == "basicvsr":
                     expected = upscale_basicvsr_video(source, output, 64, 64, 24.0, 0.25, root / "model-cache" / "basicvsr")
+                elif model in {"edvr", "tdan", "basicvsr_v1", "iconvsr", "realbasicvsr"}:
+                    expected = upscale_mmagic_video(model, source, output, 64, 64, 24.0, 0.25, root / "model-cache" / model)
+                else:
+                    expected = upscale_nanovsr_video(source, output, 64, 64, 24.0, 0.25, root / "model-cache" / "nanovsr")
             else:
                 from ai_image_models import upscale_video
                 expected = upscale_video(source, output, model, 64, 64, 24.0, 0.25, root / "model-cache")
